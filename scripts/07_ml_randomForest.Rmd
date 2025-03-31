@@ -1,0 +1,1365 @@
+---
+title: "ML Random Forest"
+author: "Jennie Yao"
+date: "2023-10-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(here)
+library(ggplot2)
+library(pROC)
+library(randomForest)
+# for parallel computing on mac
+library(parallel)
+library(foreach)
+library(doParallel)
+library(knitr)
+library(kableExtra)
+```
+
+A separate file of Random Forest model analysis
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "07_ml_randomForest.Rmd")
+fs::dir_create(outdir)
+```
+
+
+
+Run this after  `05_cleaning_imputation.Rmd`
+
+Goal:  
+
+- Split data into training and testing set  
+- Train, validate, test Random Forest models
+
+
+Read imputated data
+```{r check imputed data}
+df_ml <- readRDS(here("output", "05_cleaning_imputation.Rmd", "df_imputed.rds"))
+dim(df_ml)
+df_ml %>% select(Evaluation) %>% summary()
+```
+
+For this analysis we are excluding samples with "Review"  
+Change "Pending" to "Reject"  
+
+Variables are NOT scaled in random forest
+
+```{r exclude Review and scale numeric variables}
+# Removed "Review", change "Pending" to "Reject"
+# Set "Accept" = 1, "Reject" = 0
+df_ml_no_review <- df_ml %>% 
+  filter(Evaluation != "Review") %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Accept", 1, 0)) %>%
+  mutate(Evaluation = factor(Evaluation, levels = 0:1, labels = c("Reject", "Accept"))) #%>%
+  #mutate(across(where(is.numeric), scale)) # Scale the numeric predictors 
+```
+
+
+# RF without down-sampling
+
+## Split training and testing set
+
+Training and testing data is split as 75% and 25%
+
+```{r split to training and testing, eval=FALSE, include=FALSE}
+# Number of total rows in the dataset
+total_rows <- nrow(df_ml_no_review) 
+
+# Number of rows for training (75%) and testing (25%)
+train_rows <- round(0.75 * total_rows)  # 75% for training
+test_rows <- total_rows - train_rows  # 25% for testing
+
+# Randomly select the rows for training
+set.seed(918)
+train_indices <- sample(1:total_rows, train_rows)
+
+# Create the training and testing datasets
+train_data_id <- df_ml_no_review[train_indices, ] 
+train_data <- train_data_id %>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+
+test_data_id <- df_ml_no_review[-train_indices, ] 
+test_data <- test_data_id%>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+
+# save training and testing data for future use
+saveRDS(train_data, file = file.path(outdir, "rf_train.RDS"))
+saveRDS(test_data, file = file.path(outdir, "rf_test.RDS"))
+```
+
+```{r}
+# read training and testing data for future use
+train_data <- readRDS(file = file.path(outdir, "rf_train.RDS"))
+test_data <- readRDS(file = file.path(outdir, "rf_test.RDS"))
+```
+
+## Random forest
+
+Random forests provide an improvement over bagged trees by way of a small tweak that decorrelates the trees. As in bagging, we build a number of decision trees on bootstrapped training samples. But when building these decision trees, each time a split in a tree is considered, a random sample of *m* predictors is chosen as split candidates from the full set of *p* predictors.
+The split is allowed to use only one of those *m* predictors.
+
+In other words, in building a random forest, at each split in the tree, the algorithm is not even allowed to consider a majority of the available predictors. This may sound crazy, but it has a clever rationale. Suppose that there is one very strong predictor in the data set, along with a number of other moderately strong predictors. Then in the collection of bagged
+variable importance random forest trees, most or all of the trees will use this strong predictor in the top split. Consequently, all of the bagged trees will look quite similar to each other. Hence the predictions from the bagged trees will be highly correlated. Unfortunately, averaging many highly correlated quantities does not lead to as large of a reduction in variance as averaging many uncorrelated quantities. In particular, this means that bagging will not lead to a substantial reduction in variance over a single tree in this setting.
+
+Random forests overcome this problem by forcing each split to consider only a subset of the predictors, giving other less-important predictors a chance. We can think of this process as **decorrelating** the trees, thereby making the average of the resulting trees less variable and hence more reliable.
+
+The OOB error is used to estimate the performance of a Random Forest model without the need for a separate validation dataset. 
+Here's how the OOB error works in Random Forest:
+
+1. Bootstrapping (Random Sampling with Replacement): Random Forest builds multiple decision trees. To create each tree, it samples the training dataset with replacement (bootstrapping). This means that each decision tree is trained on a different subset of the data.
+2. Out-of-Bag Data: When data is sampled with replacement, some observations are not included in the training subset for a specific tree. These omitted data points are referred to as "out-of-bag" (OOB) data for that particular tree.
+3. Estimating Error: Each tree in the Random Forest is tested on the OOB data that were not used during its training. This provides an estimate of how well the tree generalizes to unseen data. The OOB error for a specific tree is calculated based on its performance on the OOB data.
+3. Aggregate OOB Errors: The OOB errors from all the individual trees in the Random Forest are aggregated or averaged to compute the overall OOB error for the entire Random Forest model.
+
+
+### Tune random forest
+
+The `tuneRF()` function allows us to find the `mtry` (*m*) number that gives the least OOB error to use in the randomForrest training. 
+
+```{r rf oob tune, eval=FALSE, include=FALSE}
+set.seed(918)
+## Tuned random forest result
+# default mtryStart is sqrt(p) where p is number of variables (same as in randomForest)
+tune = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], 
+              ntreeTry = 5000, 
+              plot = TRUE)
+
+#tune_df <- data.frame(tune)
+# extract best mtry value that gives the lowest OOB error
+best_mtry_rf <- tune %>% 
+  data.frame() %>%
+  filter(OOBError == min(OOBError)) %>%
+  pull(mtry)
+
+saveRDS(best_mtry_rf, file = file.path(outdir, "best_mtry_rf.RDS"))
+```
+
+
+`mtry` is the number of predictors should be considered for each split of the tree
+
+* if `mtry` = total number of predictors, then it is bagging (trees are correlated)
+* if `mtry` < total number of predictors, then it is random forest (de-correlated the trees)
+
+
+Tune best `ntree` (very computation expensive step, so save output to prevent the need to run it again) -- see below rfdown sample
+```{r tube best ntree, eval=FALSE, include=FALSE}
+set.seed(918)
+# Create a Random Forest model with a range of ntree values
+ntree_values_rf <- seq(1, 5000, by = 50)  # Adjust the range as needed
+oob_errors_rf <- numeric(length(ntree_values_rf))
+
+## For parallel processing
+# Detect the number of cores available
+num_cores <- detectCores() - 3  # Use one less than the total number of cores
+
+# Create a cluster
+cl <- makeCluster(num_cores)
+
+# Register the parallel backend
+registerDoParallel(cl)
+
+
+## fit random forests
+#for (i in 1:length(ntree_values)) {
+  #rf_model <- randomForest(Evaluation ~ ., data = train_data, ntree = ntree_values[i], mtry = best_mtry) # use tuned mtry
+  #oob_errors[i] <- rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+#}
+
+best_mtry_rf <- readRDS(file = file.path(outdir, "best_mtry_rf.RDS"))
+
+# Run the process in parallel
+oob_errors_rf <- foreach(i = 1:length(ntree_values_rf), .combine = c, .packages = "randomForest") %dopar% {
+  rf_model <- randomForest(Evaluation ~ ., 
+                           data = train_data, 
+                           ntree = ntree_values_rf[i], 
+                           mtry = best_mtry_rf)
+  rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+}
+
+# Stop the cluster
+stopCluster(cl)
+
+# Plot OOB error vs. ntree values
+plot(ntree_values_rf, oob_errors_rf, type = "b", xlab = "Number of Trees", ylab = "OOB Error")
+
+# up to 100,000
+
+# Create a dataframe to store the results
+tune_results_rf <- data.frame(ntree = ntree_values_rf, OOB_Error = oob_errors_rf)
+# Extract the best ntree value with the lowest OOB error
+best_ntree_rf <- tune_results_rf$ntree[which.min(tune_results_rf$OOB_Error)]
+
+saveRDS(best_ntree_rf, file = file.path(outdir, "best_ntree_rf.RDS"))
+```
+
+
+## Train
+
+Train a Random Forest model using tuned variables
+
+NOTE: we use an ODD number for ntree. This is because when the forest/ensembl is used on test data, ties are broken randomly. Having an odd number of trees avoids this issue and makes the model fully deterministic.
+```{r rf read tuned parameters}
+best_mtry_rf <- readRDS(file = file.path(outdir, "best_mtry_rf.RDS"))
+best_ntree_rf <- readRDS(file = file.path(outdir, "best_ntree_rf.RDS"))
+```
+
+
+```{r rf train, eval=FALSE, include=FALSE}
+set.seed(918)
+rf = randomForest(Evaluation ~ ., data = train_data, ntree = best_ntree_rf, mtry = best_mtry_rf, keep.forest = TRUE, importance = TRUE)
+saveRDS(rf, file = file.path(outdir, "rf_model.RDS"))
+```
+
+Visualize a sample tree
+```{r}
+rf <- readRDS(file = file.path(outdir, "rf_model.RDS"))
+library(devtools)
+if(!('reprtree' %in% installed.packages())){
+   install_github('munoztd0/reprtree')
+}
+
+# Set the output file to a high-resolution PNG
+png(file.path(outdir, "rf_tree.png"), width = 25000, height = 5000, res = 300)
+reprtree:::plot.getTree(rf)
+# Close the device to save the file
+dev.off()
+```
+
+
+
+### OOB
+
+Extract the OOB votes (for the training set)
+Determine the OOB predictions
+
+OOB error rate plotted against the number of number of trees
+```{r rf tree VS error rate}
+# each row in rf$err.rate represent the number of trees (from 1 to ntree) included in the model. 
+# The OOB column shows the overall error rate (misclassification rate) across all classes.
+# the Reject and Accept columns show the per-class error rate 
+plot(1:best_ntree_rf, rf$err.rate[, 1],
+     col = "red",
+     type = "l",
+     xlab = "Number of Trees",
+     ylab = "Error Rate", ylim = c(0, 0.3))
+```
+Explored the out of bag misclassification error rate as a function of number of trees. We see that the error stabilizes after roughly 500 trees.
+
+
+
+
+Overall OOB error rate (the avarage)
+```{r}
+# Extract OOB error rates
+rf_oob_error <- as.data.frame(rf$err.rate) # oob for each tree
+rf_average_oob <- mean(rf_oob_error$OOB) # same value as the OOB estimate of error rate in rfds
+rf_average_oob
+```
+OOB confusion matrix
+```{r}
+# Extract OOB votes
+rf_oob_votes <- rf$votes
+
+# OOB predictions (class with the highest vote probability)
+rf_oob_predictions <- colnames(rf_oob_votes)[max.col(rf_oob_votes)]
+
+# Confusion matrix for OOB predictions
+rf_conf_matrix_oob <- table(Actual = train_data$Evaluation, Predicted = rf_oob_predictions)
+
+# Print the confusion matrix
+print(rf_conf_matrix_oob)
+```
+
+OOB accuracy
+```{r}
+rf_oob_accuracy <- 1-(sum(diag(rf_conf_matrix_oob)) / sum(rf_conf_matrix_oob))
+rf_oob_accuracy
+```
+
+
+OOB sensitivity and specificity
+```{r}
+# Sensitivity
+rf_oob_sensitivity <-
+  (rf_conf_matrix_oob[2,1]/(rf_conf_matrix_oob[2,1]+rf_conf_matrix_oob[2,2]))*100
+# Specificity
+rf_oob_specificity<-
+  (rf_conf_matrix_oob[1,2]/(rf_conf_matrix_oob[1,2]+rf_conf_matrix_oob[1,1]))*100
+
+rf_oob_sensitivity
+rf_oob_specificity
+```
+
+ROC AUC
+```{r}
+rf_oob_roc <- roc(train_data$Evaluation, rf_oob_votes[, "Accept"], plot = TRUE, print.auc = TRUE)
+rf_oob_auc <- auc(rf_oob_roc)
+
+rf_oob_roc
+print(rf_oob_auc)
+```
+
+
+## Test/Predict
+
+```{r rf test}
+rf_pred = predict(rf, test_data)
+actual_values <- test_data$Evaluation
+rf_conf_matrix <- table(actual_values, rf_pred)
+rf_conf_matrix
+```
+
+
+```{r}
+rf_pred_accuracy <- sum(diag(rf_conf_matrix)) / sum(rf_conf_matrix)
+rf_pred_accuracy
+```
+
+
+### Sensitivity Specificity AUC
+```{r rf sens spec}
+# Sensitivity
+rf_sensitivity <-
+  (rf_conf_matrix[2,2]/(rf_conf_matrix[2,2]+rf_conf_matrix[2,1]))*100
+# Specificity
+rf_specificity<-
+  (rf_conf_matrix[1,1]/(rf_conf_matrix[1,1]+rf_conf_matrix[1,2]))*100
+```
+
+```{r rf roc}
+# predict as probabilities instead of "Reject" and "Accept"
+rf_pred_prob <- predict(rf, test_data, type="prob") %>% 
+  data.frame()
+
+rf_roc <- roc(test_data$Evaluation, rf_pred_prob$Accept, plot = TRUE, print.auc = TRUE)
+rf_auc <- auc(rf_roc)
+```
+
+
+
+
+### Variable of importance
+
+Variable importance measures: 
+
+* `MeanDecreaseAccuracy` (MDA) measures how much the accuracy of the Random Forest model decreases when a particular predictor variable is randomly permuted while keeping other variables constant. The larger the decrease in accuracy, the more important the variable is considered. Higher MDA values suggest that a variable is more important in making accurate predictions. Conversely, lower MDA values suggest that a variable has less influence on the model's accuracy.
+* `MeanDecreaseGini` measures how much each predictor variable contributes to the overall reduction in Gini impurity when splitting the data at each node of the tree. Gini impurity is a measure of how often a randomly chosen element would be incorrectly classified.
+
+
+```{r rf variable ordered by importance MDA}
+# Variable importance plot (with MeanDecreaseAccuracy score)
+varImpPlot(rf, sort = T, main = "Variable Importance down-sampled (top 20)", n.var = 20, type = 1) # for this to work, need to use importance = TRUE in randomForest
+```
+
+
+```{r rf variable ordered by importance Gini}
+# Variable importance plot (with MeanDecreaseGini score)
+varImpPlot(rf, sort = T, main = "Variable Importance (top 20)", n.var = 20, type = 2)
+
+# print the list of all predictors ordered by importance
+rf_importance <- rf$importance
+
+# Sort the features by their importance
+sorted_rf_importance <- rf_importance[order(-rf_importance[, 1]), , drop = FALSE]
+
+# Print the sorted feature importance
+#print("Feature Importance:")
+#print(sorted_rf_importance)
+```
+
+
+
+Explored the out of bag misclassification error rate as a function of number of trees. We see that the error stabilizes after roughly 200 trees.
+
+
+# RF with down-sampling
+
+## Tune
+
+Perform down-sampling: For each tree, down-sample "Reject" numbers to match the "Accept" numbers
+
+```{r rf downsampling}
+tmp = as.vector(table(train_data$Evaluation))
+num_classes = length(tmp)
+min_size = tmp[order(tmp, decreasing=FALSE)[1]] 
+sampsizes = rep(min_size, num_classes)
+```
+
+Use downsampling to tune random forest
+The `tuneRF()` function allows us to find the `mtry` (*m*) number that gives the least OOB error to use in the randomForrest training. 
+
+```{r rfds oob tune, eval=FALSE, include=FALSE}
+set.seed(918)
+## Tuned random forest result
+# default mtryStart is sqrt(p) where p is number of variables (same as in randomForest)
+tune_rfds = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], 
+              ntreeTry = 5000, 
+              plot = TRUE, 
+              sampsize = sampsizes)
+
+#tune_df <- data.frame(tune)
+# extract best mtry value that gives the lowest OOB error
+best_mtry_rfds <- tune_rfds %>% 
+  data.frame() %>%
+  filter(OOBError == min(OOBError)) %>%
+  pull(mtry)
+saveRDS(best_mtry_rfds, file = file.path(outdir, "best_mtry_rfds.RDS"))
+```
+
+Tune ntree
+
+```{r tune best ntree, eval=FALSE, include=FALSE}
+set.seed(918)
+
+best_mtry_rfds <- readRDS(file = file.path(outdir, "best_mtry_rfds.RDS"))
+
+# Create a Random Forest model with a range of ntree values
+ntree_values_rfds <- seq(1, 5000, by = 50)  # Adjust the range as needed
+oob_errors_rfds <- numeric(length(ntree_values_rfds))
+
+## For parallel processing
+# Detect the number of cores available
+num_cores <- detectCores() - 1  # Use less than the total number of cores
+
+# Create a cluster
+cl <- makeCluster(num_cores)
+
+# Register the parallel backend
+registerDoParallel(cl)
+
+
+## fit random forests
+#for (i in 1:length(ntree_values)) {
+  #rf_model <- randomForest(Evaluation ~ ., data = train_data, ntree = ntree_values[i], mtry = best_mtry) # use tuned mtry
+  #oob_errors[i] <- rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+#}
+
+# Run the process in parallel
+oob_errors_rfds <- foreach(i = 1:length(ntree_values_rfds), .combine = c, .packages = "randomForest") %dopar% {
+  # fit randomForest model
+  rf_model <- randomForest(Evaluation ~ ., 
+               data = train_data, 
+               importance = TRUE, 
+               ntree = ntree_values_rfds[i], 
+               mtry = best_mtry_rfds, 
+               proximity = TRUE, 
+               sampsize = sampsizes, 
+               na.action = na.omit)
+  # extract error 
+  rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+}
+
+# Stop the cluster
+stopCluster(cl)
+
+# Create a dataframe to store the results
+tune_results_rfds <- data.frame(ntree = ntree_values_rfds, OOB_Error = oob_errors_rfds)
+# Extract the best ntree value with the lowest OOB error
+best_ntree_rfds <- tune_results_rfds$ntree[which.min(tune_results_rfds$OOB_Error)]
+
+# save results
+saveRDS(tune_results_rfds, file = file.path(outdir, "tune_results_rfds.RDS"))
+saveRDS(best_ntree_rfds, file = file.path(outdir, "best_ntree_rfds.RDS"))
+
+# Plot OOB error vs. ntree values
+plot(ntree_values_rfds, oob_errors_rfds, type = "b", xlab = "Number of Trees", ylab = "OOB Error")
+```
+
+
+
+make sure model is fully deterministic, so use 5001 (if it is an even number then plus 1)
+
+```{r rf downsampled training, eval=FALSE, include=FALSE}
+set.seed(918)
+rfds = randomForest(Evaluation ~ ., data = train_data, 
+                             importance = TRUE, ntree = best_ntree_rfds, mtry = best_mtry_rfds, 
+                             proximity = TRUE, sampsize = sampsizes, na.action = na.omit)
+
+saveRDS(rfds, file = file.path(outdir, "rf_downsample.RDS"))
+```
+
+
+## OOB
+
+For the training data, each tree is trained on a subset of samples and a subset of features, and make predictions on the held-out set (out of bag). Each sample in the held-out set passes through the tree and gets a "vote" on whether it is Reject or Accept. This process repeats for the number of trees in the forest. The fraction of votes for Reject/Accept is an estimate of the probability of Reject/Accept and all samples will be predicted as either Reject or Accept (using probability of 0.5 as the threshold). By comparing these predictions based on the OOB data to their known class, estimates of the accuracy of the overall forest can be obtained. 
+
+```{r}
+rfds = readRDS(file = file.path(outdir, "rf_downsample.RDS"))
+```
+
+
+Overall OOB error rate (the avarage)
+```{r}
+# Extract OOB error rates
+rfds_oob_error <- as.data.frame(rfds$err.rate) # oob for each tree
+rfds_average_oob <- mean(rfds_oob_error$OOB) # same value as the OOB estimate of error rate in rfds
+rfds_average_oob
+```
+OOB confusion matrix
+```{r}
+# Extract OOB votes
+rfds_oob_votes <- rfds$votes
+
+# OOB predictions (class with the highest vote probability)
+rfds_oob_predictions <- colnames(rfds_oob_votes)[max.col(rfds_oob_votes)]
+
+# Confusion matrix for OOB predictions
+rfds_conf_matrix_oob <- table(Actual = train_data$Evaluation, Predicted = rfds_oob_predictions)
+
+# Print the confusion matrix
+print(rfds_conf_matrix_oob)
+```
+
+OOB accuracy
+```{r}
+rfds_oob_accuracy <- 1-(sum(diag(rfds_conf_matrix_oob)) / sum(rfds_conf_matrix_oob))
+rfds_oob_accuracy
+```
+
+
+OOB sensitivity and specificity
+```{r}
+# Sensitivity
+rfds_oob_sensitivity <-
+  (rfds_conf_matrix_oob[2,1]/(rfds_conf_matrix_oob[2,1]+rfds_conf_matrix_oob[2,2]))*100
+# Specificity
+rfds_oob_specificity <-
+  (rfds_conf_matrix_oob[1,2]/(rfds_conf_matrix_oob[1,2]+rfds_conf_matrix_oob[1,1]))*100
+
+rfds_oob_sensitivity
+rfds_oob_specificity
+```
+
+ROC AUC
+```{r}
+rfds_oob_roc <- roc(train_data$Evaluation, rfds_oob_votes[, "Accept"], plot = TRUE, print.auc = TRUE)
+rfds_oob_auc <- auc(rfds_oob_roc)
+
+rfds_oob_roc
+print(rfds_oob_auc)
+```
+
+
+```{r}
+# Generate OOB predicted probabilities
+rfds_oob_pred_prob <- predict(rfds, type = "prob")
+
+# Extract the positive class probability
+#positive_class <- levels(rfds$Evaluation)[2]  # Assuming the second level is the positive class
+rfds_oob_pred <- rfds_oob_pred_prob[, "Accept"]
+
+# Generate the ROC curve object using OOB predictions
+rfds_oob_roc <- roc(train_data$Evaluation, rfds_oob_pred)
+#roc(train_data$Evaluation, rfds_oob_votes[, "Accept"])
+
+# Extract ROC curve data for plotting
+roc_data_oob <- data.frame(
+  specificity = rev(1 - rfds_oob_roc$specificities),
+  sensitivity = rev(rfds_oob_roc$sensitivities)
+)
+
+# Calculate the AUC
+rfds_oob_auc <- round(auc(rfds_oob_roc), 3)
+
+# Plot the ROC curve using ggplot2
+oob_roc_plot <- ggplot(roc_data_oob, aes(x = specificity, y = sensitivity)) +
+  geom_line(color = "darkorange", size = 1.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "OOB ROC Curve (Random Forest)",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12)
+  ) +
+  annotate(
+    "text",
+    x = 0.75,
+    y = 0.25,
+    label = paste("AUC =", rfds_oob_auc),
+    size = 6,
+    color = "black",
+    fontface = "bold"
+  )
+
+# Show the ROC curve
+oob_roc_plot
+
+# Save the ROC plot as an image
+ggsave(filename = file.path(outdir, "rfds_oob_roc.png"), plot = oob_roc_plot, width = 8, height = 5, dpi = 300)
+```
+
+
+
+## Prediction on test set
+
+Make predictions on the test set
+
+```{r rfds predictions and confusion matrix}
+rfds_pred = predict(rfds, test_data)
+
+# save the predictions from the down-sampled random forest model
+saveRDS(rfds_pred, file = file.path(outdir, "rf_pred_downsample.RDS"))
+
+# Confusion matrix
+actual_values <- test_data$Evaluation
+rfds_conf_matrix <- table(actual_values, rfds_pred)
+rfds_conf_matrix
+```
+
+
+
+### Accuracy
+```{r rfds accuracy}
+rfds_pred_accuracy <- sum(diag(rfds_conf_matrix)) / sum(rfds_conf_matrix)
+rfds_pred_accuracy
+```
+
+
+### Sensitivity Specificity AUC
+
+```{r rfds sens spec}
+# Sensitivity
+rfds_sensitivity <-
+  (rfds_conf_matrix[2,2]/(rfds_conf_matrix[2,2]+rfds_conf_matrix[2,1]))*100
+# Specificity
+rfds_specificity<-
+  (rfds_conf_matrix[1,1]/(rfds_conf_matrix[1,1]+rfds_conf_matrix[1,2]))*100
+
+rfds_sensitivity
+rfds_specificity
+```
+
+
+```{r rfds roc auc}
+# predict as probabilities instead of "Reject" and "Accept"
+rfds_pred_prob <- predict(rfds, test_data, type="prob") %>% 
+  data.frame()
+#rfds_pred <- data.frame(tree_pred)
+
+rfds_roc <- roc(test_data$Evaluation, rfds_pred_prob$Accept, plot = TRUE, print.auc = TRUE)
+rfds_auc <- auc(rfds_roc)
+```
+
+ROC 
+```{r rfds pred roc for export}
+# Generate the ROC curve object
+rfds_roc <- roc(test_data$Evaluation, rfds_pred_prob$Accept)
+
+# Extract ROC curve data for plotting
+roc_data <- data.frame(
+  specificity = rev(1 - rfds_roc$specificities),
+  sensitivity = rev(rfds_roc$sensitivities)
+)
+
+# Calculate the AUC
+rfds_auc <- round(auc(rfds_roc), 3)
+
+# Plot the ROC curve using ggplot2
+downsample_roc <- ggplot(roc_data, aes(x = specificity, y = sensitivity)) +
+  geom_line(color = "steelblue", size = 1.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "Test set ROC Curve (Random Forest)",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12)
+  ) +
+  annotate(
+    "text",
+    x = 0.75,
+    y = 0.25,
+    label = paste("AUC =", rfds_auc),
+    size = 6,
+    color = "mistyrose4",
+    fontface = "bold"
+  )
+
+downsample_roc
+
+ggsave(filename = file.path(outdir, "downsample_roc.png"), plot = downsample_roc, width = 8, height = 5, dpi = 300)
+```
+
+### Prediction probabilities plot
+**NOT USED ANYMORE**
+
+Separate the test set peptides based on their true accept reject labels, then plot their predicted probabilities
+```{r}
+rfds_pred_prob <- predict(rfds, test_data, type = "prob") %>% 
+  data.frame()
+
+test_data_downsample_prob <- bind_cols(test_data, rfds_pred_prob)
+```
+
+```{r}
+true_accept_prob <- test_data_downsample_prob %>% filter(Evaluation == "Accept") %>% select(Accept) 
+quantile(true_accept_prob$Accept, 0.1)
+```
+
+
+```{r echo=FALSE}
+# Accept predicted as Accept 
+hist_accept_accept <- test_data_downsample_prob %>% 
+  filter(Evaluation == "Accept") %>% 
+  ggplot(aes(Accept)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density..), fill = "lightsalmon", alpha = 0.7, color = "black") + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  geom_density(aes(x = Accept, y = ..density..), color = "lightgrey") + 
+  # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Accept", 
+       title = "Test set: Probability distribution of Accept peptides classified as Accept")
+  #geom_histogram(aes(x = Reject, y = ..density..), fill = "steelblue", alpha = 0.7) + 
+  #geom_density(aes(x = Reject, y = ..density..), color = "lightgrey", size = 1)
+  #scale_fill_manual(labels = c("Accept prob", "Reject prob"), values = c("lightsalmon", "steelblue"))
+```
+
+
+```{r echo=FALSE}
+# True Reject peptides predicted as Accept
+hist_reject_accept <- test_data_downsample_prob %>% 
+  filter(Evaluation == "Reject") %>% 
+  ggplot(aes(Accept)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density..), fill = "steelblue", alpha = 0.7, color = "black") + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  geom_density(aes(y = ..density..), color = "lightgrey") + 
+  # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Accept", 
+       title = "Test set: Probability distribution of Reject peptides classified as Accept")
+hist_reject_accept
+```
+
+
+For true Accept peptides, plot the probability distribution of them classified as Accept and Reject. 
+
+```{r eval=FALSE, include=FALSE}
+hist_downsample_test_accept <- test_data_downsample_prob %>% 
+  filter(Evaluation == "Accept") %>% 
+  select(Accept, Reject) %>% 
+  pivot_longer(
+    cols = c(Accept, Reject), names_to = "Prediction", values_to = "Probability") %>% 
+  ggplot(aes(x = Probability)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density.., fill = Prediction), alpha=0.7, position="identity") + 
+  geom_density(aes(group = Prediction), color = "antiquewhite4") + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  labs(x = "Probabilities of peptides classification", 
+       title = "Test set: Probability distribution of Accept peptides classified as Accept or Reject")
+hist_downsample_test_accept
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# Reject prob
+test_data_downsample_prob %>% 
+  filter(Evaluation == "Reject") %>% 
+  ggplot(aes(Reject)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density..), fill = "cornflowerblue", color = "black") + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  geom_density(aes(y = ..density..), color = "lightgrey", size = 1) + 
+  # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Reject", 
+       title = "Test set: Probability distribution of Reject peptides classified as Reject")
+```
+
+
+
+
+
+### Variable of importance
+
+```{r rf downsampling variable ordered by importance MDA}
+# Variable importance plot (with MeanDecreaseAccuracy score)
+varImpPlot(rfds, sort = T, main = "Variable Importance down-sampled (top 20)", n.var = 20, type = 1)
+```
+
+
+```{r rf downsampling variable ordered by importance Gini}
+# Variable importance plot (with MeanDecreaseGini score)
+varImpPlot(rfds, sort = T, main = "Variable Importance down-sampled (top 20)", n.var = 20, type = 2)
+
+png(file.path(outdir, "variable_importance_gini.png"), width = 800, height = 600)
+varImpPlot(rfds, sort = T, main = "R Model Variable Importance down-sampled (top 20)", n.var = 20, type = 2)
+dev.off()
+```
+
+ggplot version of variable of importance (MDA)
+```{r}
+# Assuming rfds is your random forest model
+# Get the variable importance values
+var_importance <- importance(rfds, type = 1) # 1=mean decrease in accuracy (MDA)
+var_importance <- data.frame(Variable = rownames(var_importance), Importance = var_importance[,1])
+
+# Sort the variable importance values and select the top 20
+top_var_importance <- var_importance %>%
+  arrange(desc(Importance)) %>%
+  head(20)
+
+# A list of full names of the top 15 variables
+var_importance_full_name <- c("Transcript support level", 
+                              "Allele expression", 
+                              "Cysteine count", 
+                              "Problematic position", 
+                              "RNA VAF",
+                              "Percentile MT class2", 
+                              "IC50 MT class1", 
+                              "Reference Match",
+                              "RNA depth",
+                              "Percentile WT class2",
+                              "NetMHCpan MT IC50 score",
+                              "Best MT IC50 score", 
+                              "IC50 MT class2",
+                              "NetMHCpan MT percentile",
+                              "Percentile MT class1", 
+                              "RNA expression",
+                              "NetMHCcons MT percentile", 
+                              "MHCflurryEL Processing MT Score",
+                              "DNA VAF",
+                              "NetMHCcons MT IC50 score"
+                              )
+
+# Modify the variable names as needed
+# Example: Add "Var_" prefix to each variable name
+top_var_importance$Variable <- var_importance_full_name
+
+write.csv(top_var_importance, file = here(outdir, "var_importance_name_anno.csv"), row.names = TRUE)
+
+# Plot the top 20 variable importance values using ggplot2
+downsample_var_imp_bar <- ggplot(top_var_importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "cornflowerblue") +
+  coord_flip() +
+  labs(
+    title = "Variable of Importance (top 20)",
+    x = "Variables",
+    y = "Mean Decrease Accuracy (MDA)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 17, face = "bold"),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12)
+  )
+downsample_var_imp_bar
+
+# Save the plot as a PNG file
+ggsave(filename = file.path(outdir, "var_importance_20.png"), plot = downsample_var_imp_bar, width = 8, height = 5, dpi = 300)
+```
+
+Least important 
+
+```{r include=FALSE}
+# print the list of all predictors ordered by importance
+importances <- importance(rfds)
+
+# Sort the importances in descending order and select the top N variables
+# Sorted by MeanDecreaseAccuracy
+importances[order(-importances[, 3]), ]
+```
+
+
+
+Least important features of importance 
+```{r}
+# Get the variable importance values
+var_importance <- importance(rfds, type = 1)  # Using Mean Decrease in Accuracy
+var_importance <- data.frame(Variable = rownames(var_importance), Importance = var_importance[,1])
+
+# Sort the variable importance values and select the bottom 20 (least important)
+least_var_importance <- var_importance %>%
+  arrange(Importance) %>%  # Sort in ascending order
+  head(20)  # Select bottom 20 variables
+least_var_importance
+```
+
+
+```{r}
+# A list of full names of the 20 least important variables
+least_var_importance_full_name <- c("MHCnuggetsI WT Percentile", 
+                                    "Biotype", 
+                                    "Position", 
+                                    "Variant Type", 
+                                    "MHCnuggetsI WT IC50 Score",
+                                    "Corresponding Fold Change", 
+                                    "NetMHCpanEL WT Percentile", 
+                                    "NetMHCpanEL WT IC50 Score",
+                                    "Corresponding WT Percentile",
+                                    "MHCflurryEL Presentation WT Percentile",
+                                    "SMM WT IC50 Score",
+                                    "SMMPMBEC WT Percentile", 
+                                    "SMMPMBEC MT Percentile",
+                                    "PickPocket WT IC50 Score",
+                                    "SMMPMBEC WT IC50 Score", 
+                                    "NetMHCcons WT IC50 Score",
+                                    "NetMHC WT Percentile", 
+                                    "MHCflurry MT Percentile",
+                                    "Median Fold Change",
+                                    "NetMHC WT IC50 Score"
+                                    ) 
+
+# Modify the variable names as needed
+least_var_importance$Variable <- least_var_importance_full_name
+
+# Save the data as a CSV
+write.csv(least_var_importance, file = here(outdir, "least_var_importance_name_anno.csv"), row.names = TRUE)
+
+# Plot the bottom 20 variable importance values using ggplot2
+least_var_imp_bar <- ggplot(least_var_importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  coord_flip() +
+  labs(
+    title = "Least Important Variables (Bottom 20)",
+    x = "Variables",
+    y = "Mean Decrease Accuracy (MDA)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 17, face = "bold"),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12)
+  )
+least_var_imp_bar
+
+# Save the plot as a PNG file
+ggsave(filename = file.path(outdir, "least_var_importance_20.png"), plot = least_var_imp_bar, width = 8, height = 5, dpi = 300)
+```
+
+Gini score least important 20 features
+```{r}
+# Get the variable importance values
+var_importance <- importance(rfds, type = 2)  # Using Mean Decrease in Gini
+var_importance <- data.frame(Variable = rownames(var_importance), Importance = var_importance[,1])
+
+# Sort the variable importance values and select the bottom 20 (least important)
+least_var_importance <- var_importance %>%
+  arrange(Importance) %>%  # Sort in ascending order
+  head(20)  # Select bottom 20 variables
+least_var_importance
+
+# Assuming least_var_importance is already created as above
+least_var_importance <- least_var_importance %>%
+  mutate(Variable = factor(Variable, levels = Variable))  # Preserve order in plot
+
+# Plot
+gini_least20_plot <- ggplot(least_var_importance, aes(x = Variable, y = Importance)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "R model Bottom 20 Features by Importance",
+    x = "Variable",
+    y = "Importance (Mean Decrease in Gini Impurity)"
+  )
+gini_least20_plot
+# Save the plot as a PNG file
+ggsave(filename = file.path(outdir, "least_var_importance_20_gini.png"), plot = gini_least20_plot, width = 8, height = 5, dpi = 300)
+```
+
+
+## Predict on "Review" class
+
+For training and testing above, the dataset did not include peptides under "Review". We can apply the model on these peptides to see that the predicted probabilities are, and see if they fall in a middle area between 1 (Accept) and 0 (Reject)
+
+```{r}
+df_review <- df_ml %>% 
+  filter(Evaluation == "Review") %>%
+  mutate(across(where(is.numeric), scale))
+```
+
+```{r}
+rfds_pred_review = predict(rfds, df_review)
+actual_values_review <- df_review$Evaluation
+rfds_review_conf_matrix <- table(actual_values_review, rfds_pred_review)
+rfds_review_conf_matrix
+```
+All "Review" peptides were predicted as "Rejects" by the downsample rf model.
+
+
+
+```{r echo=FALSE}
+rf_pred_review_prob <- predict(rfds, df_review, type = "prob") %>% 
+  data.frame()
+rf_pred_review_prob %>% 
+  ggplot(aes(Reject)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density..), fill = "cornflowerblue", color = "black") + 
+  # aes(y = ..density..) maps the density (proportions) of the data to the y-axis instead of counts.
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  geom_density(aes(y = ..density..), color = "lightgrey", linewidth = 1) + 
+  # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Reject", 
+       title = "Review peptides: Probability distribution of Review peptides classified as Reject", 
+       subtitle = "Probability of the same peptide classified as Accept is 1 minus the probability of it classified as \nReject")
+
+hist_downsample_review_accept <- rf_pred_review_prob %>% 
+  ggplot(aes(Accept)) + 
+  theme_minimal() + 
+  geom_histogram(aes(y = ..density..), fill = "mistyrose2", color = "black") + 
+  # aes(y = ..density..) maps the density (proportions) of the data to the y-axis instead of counts.
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "firebrick1") + 
+  geom_density(aes(y = ..density..), color = "lightgrey") + 
+  # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Accept", 
+       title = "Review peptides: Probability distribution of Review peptides classified as Accept")
+hist_downsample_review_accept
+```
+
+
+# One VS Rest Random Forest
+
+One-vs-Rest (OvR) or One-vs-All (OvA):
+
+* In this approach, you train a separate Random Forest model for each class. Each model is trained to distinguish one class from the rest.
+* During prediction, you run all models on a new data point, and the class assigned by the model with the highest probability becomes the final prediction.
+
+```{r}
+df_all <- df_ml %>% 
+  mutate(Evaluation = as.character(Evaluation)) %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation)) %>%
+  mutate(Evaluation = factor(Evaluation, levels = unique(Evaluation))) %>%
+  mutate(across(where(is.numeric), scale)) # Scale the numeric predictors so they each have 0 mean 1 sd
+
+summary(df_all$Evaluation)
+```
+
+Training and testing data is split as 75% and 25%
+
+```{r ovr split data into training and testing set}
+# Set seed for reproducibility
+set.seed(918)
+
+# Number of total rows in the dataset
+total_rows <- nrow(df_all) 
+
+# Number of rows for training (75%) and testing (25%)
+train_rows <- round(0.75 * total_rows)  # 75% for training
+test_rows <- total_rows - train_rows  # 25% for testing
+
+# Randomly select the rows for training
+train_indices <- sample(1:total_rows, train_rows)
+
+# Create the training and testing datasets
+train_data_all <- df_all[train_indices, ] %>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+test_data_all <- df_all[-train_indices, ] %>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+```
+
+Training and testing data summary
+```{r}
+train_data_all %>% select(Evaluation) %>% summary()
+test_data_all %>% select(Evaluation) %>% summary()
+```
+
+
+
+
+## Training 
+
+```{r rf ovr oob tune, eval=FALSE}
+set.seed(918)
+## Tuned random forest
+tune = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], ntreeTry = 5000)
+#tune_df <- data.frame(tune)
+best_mtry <- tune %>% 
+  data.frame() %>%
+  filter(OOBError == min(OOBError)) %>%
+  pull(mtry)
+```
+
+```{r eval=FALSE}
+# Define the class labels (replace with your actual class labels)
+class_labels <- c("Accept", "Reject", "Review")
+
+# Initialize an empty list to store the models
+rf_models <- list()
+
+for (i in 1:length(class_labels)) {
+  # Create binary labels (1 for the current class, 0 for the rest)
+  train_data <- train_data_all %>% 
+    mutate(Evaluation = ifelse(Evaluation == class_labels[i], 1, 0)) %>%
+    mutate(Evaluation = factor(Evaluation, levels = 0:1))
+  
+  # Tune random forest for best mtry with lowest oob error
+  set.seed(918)
+  #tune = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], ntreeTry = 5000)
+  #best_mtry <- tune %>% 
+      #data.frame() %>%
+    #filter(OOBError == min(OOBError)) %>%
+    #pull(mtry)
+  
+  # get the sample size of the smaller class
+  tmp = as.vector(table(train_data$Evaluation))
+  num_classes = length(tmp)
+  min_size = tmp[order(tmp, decreasing=FALSE)[1]] 
+  sampsizes = rep(min_size, num_classes)
+  
+  # Tune mtry
+  tune = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], 
+              ntreeTry = 10000, 
+              sampsize = sampsizes)
+  # extract best mtry value that gives the lowest OOB error
+  best_mtry <- tune %>% 
+      data.frame() %>%
+    filter(OOBError == min(OOBError)) %>%
+    pull(mtry)
+  
+  # Tune ntree
+  # Create a Random Forest model with a range of ntree values
+  ntree_values <- seq(1, 5000, by = 50)  # Adjust the range as needed
+  oob_errors <- numeric(length(ntree_values))
+
+  ## For parallel processing
+  # Detect the number of cores available
+  num_cores <- detectCores() - 3  # Use one less than the total number of cores
+  # Create a cluster
+  cl <- makeCluster(num_cores)
+  # Register the parallel backend
+  registerDoParallel(cl)
+  # Run the process in parallel
+  oob_errors <- foreach(i = 1:length(ntree_values), .combine = c, .packages = "randomForest") %dopar% {
+    rf_model <- randomForest(Evaluation ~ ., 
+                            data = train_data, 
+                            ntree = ntree_values[i], 
+                            mtry = best_mtry, 
+                            sampsize = sampsizes)
+    rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+  }
+
+  # Stop the cluster
+  stopCluster(cl)
+
+  # Create a dataframe to store the results
+  tune_results <- data.frame(ntree = ntree_values, OOB_Error = oob_errors)
+  # Extract the best ntree value with the lowest OOB error
+  best_ntree <- tune_results$ntree[which.min(tune_results$OOB_Error)]
+  
+  # Train a Random Forest model with downsampling
+  rf_model <- randomForest(Evaluation ~ ., data = train_data, 
+                             importance = TRUE, ntree = best_ntree, mtry = best_mtry, 
+                             proximity = TRUE, sampsize = sampsizes, na.action = na.omit)
+
+  # Store the model in the list
+  rf_models[[i]] <- rf_model
+}
+
+# save random forests models
+saveRDS(rf_models, file.path(outdir, "one_vs_rest_rfds.rds"))
+```
+
+
+
+```{r}
+rf_models <- readRDS(file = file.path(outdir, "one_vs_rest_rfds.rds"))
+```
+
+
+## OOB error for each model
+```{r}
+class_labels <- c("Accept", "Reject", "Review")
+
+# Initialize lists to store results
+oob_errors <- numeric(length(rf_models))
+sensitivity_specificity <- list()
+
+# Loop through each model in rf_models
+for (i in seq_along(rf_models)) {
+  model <- rf_models[[i]]
+  
+  # Extract OOB error
+  oob_errors[i] <- model$err.rate[nrow(model$err.rate), "OOB"]
+  
+  # Extract OOB predictions and actual labels
+  oob_predictions <- model$predicted  # OOB predictions
+  actual_labels <- model$y            # Actual labels in training data
+  
+  # Construct confusion matrix
+  conf_matrix <- table(Predicted = oob_predictions, Actual = actual_labels)
+  
+  # Calculate sensitivity and specificity
+  class_metrics <- data.frame(Model = NA, Sensitivity = NA, Specificity = NA)
+  
+  # levels(actual_labels) are "0" and "1"
+  # the conf_matrix is structured as: 
+    # Row: predicted "0", "1"
+    # Columns: predicted "0", "1"
+  
+  TP <- conf_matrix["1", "1"]  # True positives
+  FN <- conf_matrix["0", "1"]  # False negatives
+  FP <- conf_matrix["1", "0"]  # False positives
+  TN <- conf_matrix["0", "0"]  # True negatives
+    
+  # Sensitivity and Specificity
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  # Store results
+  class_metrics$Model <- seq_along(rf_models)[i]
+  class_metrics$Sensitivity <- sensitivity
+  class_metrics$Specificity<- specificity
+  
+  # Store metrics for this model
+  sensitivity_specificity[[i]] <- class_metrics
+}
+
+ovr_oob_results <- bind_rows(sensitivity_specificity) %>% 
+  mutate(Model = recode(Model, 
+                         "1" = "Accept VS rest", 
+                         "2" = "Reject VS rest", 
+                         "3" = "Review VS rest"))
+
+ovr_oob_results
+```
+
+
+## Prediction
+
+For each test data point in test_data_all, make predictions using all models. The class with the highest predicted probability becomes the final prediction.
+```{r}
+# Initialize an empty matrix to store predictions
+num_test_samples <- nrow(test_data_all)
+predictions <- matrix(NA, nrow = num_test_samples, ncol = length(class_labels))
+
+for (i in 1:length(class_labels)) {
+  # Predict the probability of the current class
+  test_data <- test_data_all
+  
+  predicted_prob <- predict(rf_models[[i]], newdata = test_data, type = "prob")[, "1"] 
+  # choose the predicted probabilities of "1"s in each model
+
+  # Store the predicted probability in the matrix
+  predictions[, i] <- predicted_prob
+}
+
+head(predictions)
+
+# Determine the class with the highest predicted probability for each test sample
+predicted_classes <- class_labels[apply(predictions, 1, which.max)]
+```
+
+```{r}
+true_classes <- test_data_all$Evaluation
+rf_ovr_confusion_matrix <- table(true_classes, predicted_classes)
+rf_ovr_accuracy <- sum(diag(rf_ovr_confusion_matrix)) / sum(rf_ovr_confusion_matrix)
+rf_ovr_recall <- diag(rf_ovr_confusion_matrix) / rowSums(rf_ovr_confusion_matrix)
+rf_ovr_precision <- diag(rf_ovr_confusion_matrix) / colSums(rf_ovr_confusion_matrix) # also Positive Predictive Value
+#f1_score <- 2 * (precision * recall) / (precision + recall)
+
+rf_ovr_confusion_matrix
+rf_ovr_accuracy
+rf_ovr_recall
+rf_ovr_precision
+```
+
+
+# Summary
+
+## Accept VS Reject models
+
+
+```{r summary table, echo=FALSE}
+summary_data <- data.frame(
+  Model = c("Random Forest", "Random Forest", "Random Forest Downsampling", "Random Forest Downsampling"),
+  Dataset = c("Out-of-Bag", "Held-out Test", "Out-of-Bag", "Held-out Test"),
+  Accuracy = c(rf_oob_accuracy, rf_pred_accuracy, rfds_oob_accuracy, rfds_pred_accuracy),
+  Sensitivity = c(rf_oob_sensitivity, rf_sensitivity, rfds_oob_sensitivity, rfds_sensitivity),
+  Specificity = c(rf_oob_specificity, rf_specificity, rfds_oob_specificity, rfds_specificity),
+  AUC = c(rf_oob_auc, rf_auc, rfds_oob_auc, rfds_auc)
+)
+
+# Round all numeric columns to 3 decimal places
+summary_data <- summary_data %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+# Modify the data to make model names appear only in the first row of each group
+formatted_data <- summary_data %>%
+  group_by(Model) %>%
+  mutate(Model = ifelse(row_number() == 1, Model, "")) %>%
+  ungroup()
+
+# Create a nested table using kable
+summary_table <- formatted_data %>%
+  kbl(caption = "Model Performance Metrics (Accept VS Reject models)", format = "html") %>%
+  kable_classic(full_width = F) %>%
+  add_header_above(c(" " = 2, "Metrics" = 4))
+
+# Print the table
+summary_table
+```
+
+
+
+For the downsampled model, we plotted the probability distribution of Accept peptides being predicted as Accept (1)
+
+```{r echo=FALSE, message=FALSE}
+hist_accept_accept
+```
+
+For Reject peptides, plotted the probability distribution of these peptides being predicted as Accept (2)
+
+```{r echo=FALSE, message=FALSE}
+hist_reject_accept
+```
+
+To see how the model performs on the Review peptides, which were not included in the training or testing set, we plotted the probability distribution of these peptides being predicted as Accept (3)
+```{r echo=FALSE, message=FALSE}
+hist_downsample_review_accept
+```
+
+## One-VS-Rest model
+
+OOB sensitivity and specificity
+
+```{r echo = FALSE}
+kable(ovr_oob_results)
+```
+
+
+
+Confusion Matrix
+```{r echo=FALSE}
+rf_ovr_confusion_matrix
+```
+
+Accuracy
+```{r echo=FALSE}
+rf_ovr_accuracy
+```
+
+# Next step
+
+* Get a set of prediction numbers for training data -- may look better
+
+
+* Set thresholds (test different thresholds) such that we allow e.g. 10% of Accept peptides to be classified as Reject, 10% of Reject peptides that are classified as Accept, then things between the thresholds are "Review"
+* Set up the pipeline to test it on one patient's sample
+  * download itb_review, all_epitopes, class2 files of that patient
+  * save them into folders
+  * run the pipeline on those files
+  * paste the predicted Evaluations back to the itb_review file
+  * upload itb_review_ml_predict back to PVACview to see how if the Evaluations show up
+
+* For each new case that is reviewed by the tumor board, count how many of the peptides were changed from the ml_predict predictions
+* Keep note of the time it takes for them to review the peptides

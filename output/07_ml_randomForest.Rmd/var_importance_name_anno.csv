@@ -1,0 +1,21 @@
+"","Variable","Importance"
+"TSL","Transcript support level",24.7744309975758
+"Allele.Expr","Allele expression",22.6009230592387
+"cysteine_count","Cysteine count",15.963108187416
+"Prob.Pos","Problematic position",14.9760065925031
+"RNA.VAF","RNA VAF",13.8275082668772
+"percentile.MT.class2","Percentile MT class2",10.9751684802284
+"IC50.MT.class1","IC50 MT class1",9.77370266678105
+"Ref.Match","Reference Match",8.80147191314697
+"RNA.Depth","RNA depth",8.05057844126097
+"percentile.WT.class2","Percentile WT class2",7.66239570277008
+"NetMHCpan.MT.IC50.Score","NetMHCpan MT IC50 score",7.30141553278798
+"Best.MT.IC50.Score","Best MT IC50 score",7.23431540851489
+"IC50.MT.class2","IC50 MT class2",6.66629306636513
+"NetMHCpan.MT.Percentile","NetMHCpan MT percentile",6.46206162384979
+"percentile.MT.class1","Percentile MT class1",6.43279865027302
+"RNA.Expr","RNA expression",6.23543516614148
+"NetMHCcons.MT.Percentile","NetMHCcons MT percentile",5.9021622867014
+"MHCflurryEL.Processing.MT.Score","MHCflurryEL Processing MT Score",5.66887075226016
+"DNA.VAF","DNA VAF",5.51471686622151
+"NetMHCcons.MT.IC50.Score","NetMHCcons MT IC50 score",5.04277547782802

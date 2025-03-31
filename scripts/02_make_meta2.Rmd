@@ -1,0 +1,394 @@
+---
+title: "make_meta2"
+author: "Jennie Yao"
+date: "2023-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+library(openxlsx)
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "02_make_meta2.Rmd")
+fs::dir_create(outdir)
+```
+
+Run this after `/Neoantigen ML project/data/meta_manual.csv` has been finalized.
+
+After make_meta.Rmd, the metadata file was modified manually
+(edits included edit patient_id, manually added file paths, notes, include_ml, driver_gene)
+
+INPUT: 
+`/Neoantigen ML project/data/meta_manual.csv`
+
+OUTCOME:  
+Output file: `metadata_count_purity.csv`; `metadata_count_purity.xlsx`  
+Description: New columns of metadata was added.  
+* Peptide counts
+  * `n_peptides`: the total number of peptides for review in that patient
+  * `n_pass`: the total number of "Pass" in the Tier column
+  * `n_accept`: the total number of "Accept" in the Evaluation column
+* Purity for driver genes
+  * `ID`: ID of the peptide from which we calaulated the purity
+  * `Gene`: the name of the mutated gene
+  * `DNA.VAF`: VAF of that gene
+  * `purity_from_driver`: `YES` or `No`. Yes if the purity was calulated from a drive gene. No otherwise. 
+  * `purity`: purity score calculated from 2*`DNA.VAF`
+
+
+UPDATE: 
+* Added a column to indicate whether the sample was for external validation
+* Modify searching files by patient_id (now can find files from each folder that contain patient_id, allowing prefix and suffix in the file name.)
+
+```{r}
+meta_manual <- read.csv(here("data", "meta_manual.csv"))
+meta_manual
+```
+
+get a list of patient_id that will be used in the ML study (NEW: also add samples for external validation/prediction)
+```{r}
+patient_id_ml <- meta_manual %>% 
+  filter(include_ML == "Yes" | external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+```
+
+
+# Update counts
+
+Read the itb_review file of each patient, extract: 
+* the total number of peptides for review in that patient
+* the total number of "Pass" in the Tier column
+* the total number of "Accept" in the Evaluation column
+
+Define the function
+```{r Define extract_num_peptides function}
+extract_num_peptides <- function(patient_id, project_dir){
+  # Find the patient's file in itb_review folder using grep
+  matching_files <- list.files(file.path(project_dir, "data", "itb_review"), 
+                               pattern = paste0(".*", patient_id, ".*\\.tsv$"))
+  
+  # if the patient's file does not exist, print a message and skip
+  if (length(matching_files) == 0) {
+    cat("Patient ID", patient_id, "not found in the directory. Skipping...\n")
+    return(NULL)
+  } else{
+    cat("Patient ID", patient_id, "calculating purity\n")
+  }
+  
+  # get files through patient id
+  itb_path <- file.path(project_dir, "data", "itb_review")
+  itb_pattern <- paste0(".*", patient_id, ".*\\.tsv$") # there are some excel files in this directory
+  itb_file_path <- list.files(itb_path, pattern = itb_pattern, full.names = TRUE)
+  itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t") 
+  
+  # count number of peptides
+  n_peptides <- nrow(itb_file)
+  #n_pass <- sum(itb_file$Tier == "Pass")
+  #n_accept <- sum(itb_file$Evaluation == "Accept")
+  n_pass <- itb_file %>%
+    filter(Tier == "Pass") %>%
+    summarise(accept_count = n()) %>%
+    pull()
+  n_accept <- itb_file %>%
+    filter(Evaluation == "Accept") %>%
+    summarise(accept_count = n()) %>%
+    pull()
+  
+  # return a dataframe with patient_id, and number of peptides
+  data.frame(patient_id, n_peptides, n_pass, n_accept)
+  
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+# This chunk for building the above function, not included in evaluation
+patient_id_debug = "G110_Region1"
+project_dir = here()
+
+matching_files <- list.files(file.path(project_dir, "data", "itb_review"), 
+                               pattern = paste0(".*", patient_id_debug, ".*\\.tsv$"))
+  
+# if the patient's file does not exist, print a message and skip
+if (length(matching_files) == 0) {
+  cat("Patient ID",
+      patient_id_debug,
+      "not found in the directory. Skipping...\n")
+  return(NULL)
+} else{
+  cat("Patient ID", patient_id_debug, "calculating purity\n")
+}
+
+# get files through patient id
+itb_path <- file.path(project_dir, "data", "itb_review")
+#itb_file_path <- list.files(itb_path, full.names = TRUE) %>%
+#grep(patient_id, ., value = TRUE)
+itb_pattern <- paste0("^", patient_id_debug, ".*\\.tsv$")
+itb_file_path <-
+  list.files(itb_path, pattern = itb_pattern, full.names = TRUE)
+itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t")
+
+# count number of peptides
+n_peptides <- nrow(itb_file)
+n_pass <- itb_file %>% 
+  filter(Tier == "Pass") %>% 
+  summarise(accept_count = n()) %>% 
+  pull()
+n_accept <- itb_file %>% 
+  filter(Evaluation == "Accept") %>% 
+  summarise(accept_count = n()) %>% 
+  pull()
+
+# return a dataframe with patient_id, and number of peptides
+data.frame(patient_id_debug, n_peptides, n_pass, n_accept)
+
+extract_num_peptides("G110_Region1", here())
+```
+
+
+Apply the function to all patient_id in metadata and merge the count values to the metadata
+```{r add peptide counts to metadata}
+# Use lapply to process each file and store the results in a list
+count_df <- lapply(patient_id_ml, extract_num_peptides, here()) %>% 
+  do.call(rbind, .)
+
+# join columns of counts to the metadata
+meta_count <- left_join(meta_manual, count_df, by = "patient_id")
+meta_count
+```
+
+
+
+
+# Purity 
+
+* Purity is an estimate of the amount of tumor cells in the resected tissue
+* It is calculated from tumor driver genes (clonal mutations)
+  * Clonal mutations are early-mutated genes in the tumor cells, such that all cancer cells (a clone) has this mutation
+  * Subclonal mutations are mutations gained in a subclone, so only a portion of the cencer cells have this mutation
+* To get purity score for each patient: 
+  * Find a set of driver genes of each patient's cancer type (from CancerGeneCensus file)
+  * Search in the patient's itb_review file for mutation in these driver genes (`Gene` column)
+  * Purity = 2*`DNA_VAF` of the driver gene
+  * VAF is the percentage of sequence reads observed matching a specific DNA variant divided by the overall coverage at that locus.
+
+
+```{r to construct get_purity, eval=FALSE}
+# get patient_id of available files
+patient_itb_path <- list.files(here("data", "itb_review"), full.names = TRUE)
+patient_id_itb <- patient_itb_path %>% 
+    basename() %>% 
+    gsub(".revd.Annotated.Neoantigen_Candidates.tsv$", "", .)
+  
+# read the patient's itb file
+itb_data_test <- read.table(patient_itb_path[14], header = TRUE, sep = "\t")
+
+# extract patient's cancer driver gene from metadata
+patient_driver_genes <- meta_manual %>% 
+  filter(patient_id == patient_id_itb[14]) %>%
+  select(driver_genes) %>%
+  as.character() %>%
+  str_split(",")
+patient_driver_genes <- patient_driver_genes[[1]]
+
+# extract patient's genes and VAF
+driver_vaf_list <- itb_data_test %>%
+  filter(Gene %in% patient_driver_genes) %>% 
+  select(ID, Gene, DNA.VAF)
+driver_vaf_list
+# check the size of the driver_vaf_list to decide which values to use for purity calculation
+
+# Initialize vaf_for_purity as an empty dataframe
+vaf_for_purity <- data.frame()
+
+# Check if driver_vaf_list only has one row and DNA.VAF is below 0.5
+if (nrow(driver_vaf_list) == 1 && driver_vaf_list$DNA.VAF < 0.5) {
+  vaf_for_purity <- data.frame(driver_vaf_list) %>% 
+    mutate(purity_from_driver = "YES", 
+           purity = DNA.VAF * 2)
+  # paste patient id in a separate column
+}
+
+# Check if driver_vaf_list only has one row BUT DNA.VAF is above 0.5
+if (nrow(driver_vaf_list) == 1 && driver_vaf_list$DNA.VAF >= 0.5) {
+  highest_vaf_row <- itb_data_test %>% 
+    filter(DNA.VAF < 0.5) %>% 
+    arrange(desc(DNA.VAF)) %>%  # Arrange by DNA.VAF in descending order
+    slice(1)  # Select the first row (highest DNA.VAF)
+  vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>% 
+    select(ID, Gene, DNA.VAF) %>% 
+    mutate(purity_from_driver = "NO",
+           purity = DNA.VAF * 2)
+}
+
+# Check if driver_vaf_list has more than one row and at least one value in DNA.VAF below 0.5
+if (nrow(driver_vaf_list) > 1 && any(driver_vaf_list$DNA.VAF < 0.5)) {
+  # Find the row with the highest DNA.VAF below 0.5
+  # highest_vaf_row <- driver_vaf_list[which.max(driver_vaf_list$DNA.VAF < 0.5), ]
+  highest_vaf_row <- driver_vaf_list %>% 
+    filter(DNA.VAF < 0.5) %>%
+    arrange(desc(DNA.VAF)) %>%
+    slice(1)
+  vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>% 
+    mutate(purity_from_driver = "YES", 
+           purity = DNA.VAF * 2)
+  #vaf_for_purity$purity_from_driver <- "YES"
+}
+# Check if driver_vaf_list has more than one row and NO values in DNA.VAF below 0.5
+if (nrow(driver_vaf_list) > 1 && !any(driver_vaf_list$DNA.VAF < 0.5)) {
+  # Find the row in itb_data_test with the highest DNA.VAF below 0.5
+  highest_vaf_row <- itb_data_test %>%
+    filter(DNA.VAF < 0.5) %>%
+    arrange(desc(DNA.VAF)) %>%
+    slice(1)
+  vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>% 
+    select(ID, Gene, DNA.VAF) %>% 
+    mutate(purity_from_driver = "NO",
+           purity = DNA.VAF * 2)
+}
+# Check if driver_vaf_list is empty
+if (nrow(driver_vaf_list) == 0) {
+  # Find the row in itb_data_test with the highest DNA.VAF below 0.5
+  #highest_vaf_row <- itb_data_test[which.max(itb_data_test$DNA.VAF < 0.5), ]
+  highest_vaf_row <- itb_data_test %>% 
+    filter(DNA.VAF < 0.5) %>% 
+    arrange(desc(DNA.VAF)) %>%  # Arrange by DNA.VAF in descending order
+    slice(1)  # Select the first row (highest DNA.VAF)
+  vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>% 
+    select(ID, Gene, DNA.VAF) %>% 
+    mutate(purity_from_driver = "NO",
+           purity = DNA.VAF * 2)
+}
+
+vaf_for_purity
+
+```
+
+Define function
+```{r Define get_purity function}
+get_purity <- function(patient_id_f, project_dir, metadata){
+  # Find the patient's file in itb_review folder using grep
+  matching_files <- list.files(file.path(project_dir, "data", "itb_review"), 
+                               pattern = paste0(".*", patient_id_f, ".*\\.tsv$"))
+  
+  # if the patient's file does not exist, print a message and skip
+  if (length(matching_files) == 0) {
+    cat("Patient ID", patient_id_f, "not found in the directory. Skipping...\n")
+    return(NULL)
+  } else{
+    cat("Patient ID", patient_id_f, "calculating purity\n")
+  }
+  
+  # get files through patient id
+  itb_path <- file.path(project_dir, "data", "itb_review")
+  #itb_file_path <- list.files(itb_path, full.names = TRUE) %>% 
+    #grep(patient_id_f, ., value = TRUE)
+  itb_pattern <- paste0(".*", patient_id_f, ".*\\.tsv$")
+  itb_file_path <- list.files(itb_path, pattern = itb_pattern, full.names = TRUE)
+  itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t") 
+  
+  # extract patient's cancer driver gene from metadata
+  patient_driver_genes <- metadata %>%
+    filter(patient_id == patient_id_f) %>%
+    select(driver_genes) %>%
+    as.character() %>%
+    str_split(",")
+  patient_driver_genes <- patient_driver_genes[[1]]
+  
+  # from itb_review file, extract patient's genes and VAF
+  driver_vaf_list <- itb_file %>%
+    filter(Gene %in% patient_driver_genes) %>%
+    select(ID, Gene, DNA.VAF)
+  
+  # Initialize vaf_for_purity as an empty dataframe
+  vaf_for_purity <- data.frame()
+  
+  ## Based on the rows in driver_vaf_list, decide which DNA.VAF value to get
+  # Check if driver_vaf_list only has one row and DNA.VAF is below 0.5
+  if (nrow(driver_vaf_list) == 1 && driver_vaf_list$DNA.VAF < 0.5) {
+    vaf_for_purity <- data.frame(driver_vaf_list) %>%
+      mutate(purity_from_driver = "YES",
+             purity = DNA.VAF * 2)
+  } else if (nrow(driver_vaf_list) == 1 && driver_vaf_list$DNA.VAF >= 0.5) {
+    highest_vaf_row <- itb_file %>%
+      filter(DNA.VAF < 0.5) %>%
+      arrange(desc(DNA.VAF)) %>%  
+      slice(1)  
+    vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>%
+      select(ID, Gene, DNA.VAF) %>%
+      mutate(purity_from_driver = "NO",
+             purity = DNA.VAF * 2)
+  } else if (nrow(driver_vaf_list) > 1 && any(driver_vaf_list$DNA.VAF < 0.5)) {
+    # Find the row with the highest DNA.VAF below 0.5
+    highest_vaf_row <- driver_vaf_list %>%
+      filter(DNA.VAF < 0.5) %>%
+      arrange(desc(DNA.VAF)) %>%
+      slice(1)
+    vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>%
+      mutate(purity_from_driver = "YES",
+             purity = DNA.VAF * 2)
+  } else if (nrow(driver_vaf_list) > 1 && !any(driver_vaf_list$DNA.VAF < 0.5)) {
+    # Find the row in itb_file with the highest DNA.VAF below 0.5
+    highest_vaf_row <- itb_file %>%
+      filter(DNA.VAF < 0.5) %>%
+      arrange(desc(DNA.VAF)) %>%
+      slice(1)
+    vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>%
+      select(ID, Gene, DNA.VAF) %>%
+      mutate(purity_from_driver = "NO",
+             purity = DNA.VAF * 2)
+  } else if (nrow(driver_vaf_list) == 0) {
+    # Find the row in itb_file with the highest DNA.VAF below 0.5
+    highest_vaf_row <- itb_file %>%
+      filter(DNA.VAF < 0.5) %>%
+      arrange(desc(DNA.VAF)) %>%  # Arrange by DNA.VAF in descending order
+      slice(1)  # Select the first row (highest DNA.VAF)
+    vaf_for_purity <- rbind(vaf_for_purity, highest_vaf_row) %>%
+      select(ID, Gene, DNA.VAF) %>%
+      mutate(purity_from_driver = "NO",
+             purity = DNA.VAF * 2)
+  }
+  
+   #return a dataframe with patient_id, and purity scores
+  vaf_for_purity <- vaf_for_purity %>% 
+    mutate(patient_id = patient_id_f)
+  
+  vaf_for_purity
+  
+  #driver_vaf_list
+}
+```
+
+```{r test get_purity function eval=FALSE}
+get_purity("TWJF-10146-MO011-0029", here(), metadata = meta_manual)
+
+get_purity("TWJF-5120-02", here(), metadata = meta_manual)
+```
+
+```{r add purity scores and other columns to metadata}
+# Use lapply to process each file and store the results in a list
+purity_df <- lapply(patient_id_ml, get_purity, here(), metadata = meta_manual) %>% 
+  do.call(rbind, .)
+
+# join columns of counts to the metadata
+meta_purity <- left_join(meta_count, purity_df, by = "patient_id")
+meta_purity
+```
+
+## Save 
+```{r save updated metadata}
+write.csv(meta_purity, file=here(outdir, "metadata_count_purity.csv"), row.names = FALSE)
+```
+
+write a excel version
+```{r}
+write.xlsx(meta_purity, file=here(outdir, "metadata_count_purity.xlsx"))
+```
+

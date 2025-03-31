@@ -1,0 +1,438 @@
+---
+title: "Threshold adjustment"
+author: "Jennie Yao"
+date: "2024-01-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(here)
+library(openxlsx)
+library(yardstick) # For confusion matrix 
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "08-1_threshold_adj.Rmd")
+fs::dir_create(outdir)
+```
+
+Threshold used for prediction categories: 
+Using the predicted probability of a peptide being "Accept", use a threshold of 0.4 and 0.6 (arbitrary numbers based on distributions and inspection):
+* predicted prob <= 0.4 --> Reject
+* 0.4 < predicted prob < 0.6 --> Review
+* predicted prob >= 0.6 --> Accept
+* NA --> Pending
+
+After this prediction, we got reviews from 4 files: 5120-16, 5120-17, 5120-18, 5120-19. 
+
+170 peptides in total from these 4 patients
+
+This document aims to re-evaluate the 0.4/0.6 thresholds, expand the "Review" category to improve prediction accuracy on the "Accept" and "Reject" categories. 
+
+
+# Combine predicted and true evaluation from these files
+```{r}
+fnames <- c("5120-16", "5120-17", "5120-18", "5120-19") # patient ID
+fnames_new <- c("5120-16", "5120-17", "5120-18", "5120-19", "5120-39", "CTEP-10146-MD017-0052", "G110_Region1", "G110_Region2", "G113_Region1") # "G113_Region2" seems to have a whole bunch of pending? check 
+pred_dir <- here("output", "08_randomForest_predict.Rmd") # random forest predictions
+eval_dir <- here("data", "itb_review_new") # the real ITB reviewed files
+```
+
+Function to merge itb reviewed file, true Evaluation, and predicted Evaluations and probabilities together into one file for analysis
+
+```{r}
+merge_pred_eval <- function(patient_id, pred_dir, eval_dir, outdir) {
+  # Locate and read prediction file
+  predict_files <- list.files(pred_dir, full.names = TRUE)
+  predict_file_path <- grep(paste0(patient_id, ".*predict2.*\\.tsv$"), predict_files, value = TRUE)
+  if (length(predict_file_path) == 0) {
+    stop(paste("No prediction file found for patient:", patient_id))
+  }
+  predict_file <- read.delim(predict_file_path)
+  
+  # Locate and read evaluation file
+  eval_files <- list.files(eval_dir, full.names = TRUE)
+  eval_file_path <- grep(patient_id, eval_files, value = TRUE)
+  if (length(eval_file_path) == 0) {
+    stop(paste("No evaluation file found for patient:", patient_id))
+  }
+  eval_file <- read.delim(eval_file_path)
+  
+  # Merge prediction and evaluation data
+  merged_df_export <- inner_join(predict_file, eval_file %>% select("ID", "Evaluation"), by = "ID") %>%
+    mutate(Pos = if (is.integer(Pos))
+      as.character(Pos)
+      else
+        Pos) %>% # make sure Pos is always type chr, sometimes it gets converted to int and messes up merging in the do.call step 
+    mutate(Ref.Match = if (!is.character(Ref.Match))
+      as.character(Ref.Match)
+      else
+        Ref.Match)
+  
+  # Export merged data frame as tsv format
+  out_name = paste0(patient_id, "_", "predict&trueEval.tsv")
+  write.table(
+    merged_df_export,
+    file = file.path(outdir, out_name),
+    sep = "\t",
+    row.names = FALSE,
+    col.names = TRUE
+  )
+  
+  # Return the merged data frame
+  return(merged_df_export)
+}
+
+#merge_pred_eval(fnames_new[9], pred_dir, eval_dir, outdir)
+```
+
+
+```{r}
+# Process all files
+all_files <- lapply(fnames, merge_pred_eval, pred_dir, eval_dir, outdir)
+all_files_new <- lapply(fnames_new, merge_pred_eval, pred_dir, eval_dir, outdir)
+
+# Different patients have different HLA types, want to remove them before merging
+# Step 1: Identify common columns among all dataframes
+common_cols <- Reduce(intersect, lapply(all_files, colnames))
+# Step 2: Subset each dataframe to keep only the common columns
+all_files <- lapply(all_files, function(df) df[, common_cols, drop = FALSE])
+all_files_new <- lapply(all_files_new, function(df) df[, common_cols, drop = FALSE])
+# Step 3: Merge all dataframes by binding rows
+all_df <- do.call(bind_rows, all_files)
+all_df_new <- do.call(bind_rows, all_files_new)
+
+
+
+# Export the combined data frame
+write.xlsx(all_df, file.path(outdir, "eval_compare.xlsx"), rowNames = FALSE)
+write.xlsx(all_df_new, file.path(outdir, "eval_compare_new.xlsx"), rowNames = FALSE)
+```
+
+
+
+# Change threshold
+
+Same function as above, but just modified to read a different file name
+```{r}
+merge_pred_eval_newThreshold <- function(patient_id, pred_dir, eval_dir, outdir) {
+  # Locate and read prediction file
+  predict_files <- list.files(pred_dir, full.names = TRUE)
+  predict_file_path <- grep(paste0(patient_id, ".*predict_newThreshold2.*\\.tsv$"), predict_files, value = TRUE)
+  if (length(predict_file_path) == 0) {
+    stop(paste("No prediction file found for patient:", patient_id))
+  }
+  predict_file <- read.delim(predict_file_path)
+  
+  # Locate and read evaluation file
+  eval_files <- list.files(eval_dir, full.names = TRUE)
+  eval_file_path <- grep(patient_id, eval_files, value = TRUE)
+  if (length(eval_file_path) == 0) {
+    stop(paste("No evaluation file found for patient:", patient_id))
+  }
+  eval_file <- read.delim(eval_file_path)
+  
+  # Merge prediction and evaluation data
+  merged_df_export <- inner_join(predict_file, eval_file %>% select("ID", "Evaluation"), by = "ID") %>%
+    mutate(Pos = if (is.integer(Pos))
+      as.character(Pos)
+      else
+        Pos) %>% # make sure Pos is always type chr, sometimes it gets converted to int and messes up merging in the do.call step 
+    mutate(Ref.Match = if (!is.character(Ref.Match))
+      as.character(Ref.Match)
+      else
+        Ref.Match)
+  
+  # Export merged data frame
+  out_name <- paste0(patient_id, "_predict&trueEval_newThreshold.tsv")
+  write.table(
+    merged_df_export,
+    file = file.path(outdir, out_name),
+    sep = "\t",
+    row.names = FALSE,
+    col.names = TRUE
+  )
+  
+  # Return the merged data frame
+  return(merged_df_export)
+}
+```
+
+
+```{r}
+# Process all files
+all_files_newThreshold <- lapply(fnames, merge_pred_eval_newThreshold, pred_dir, eval_dir, outdir)
+all_files_newThreshold_new <- lapply(fnames_new, merge_pred_eval_newThreshold, pred_dir, eval_dir, outdir)
+
+# Different patients have different HLA types, want to remove them before merging
+# Step 1: Identify common columns among all dataframes
+common_cols <- Reduce(intersect, lapply(all_files_newThreshold, colnames))
+# Step 2: Subset each dataframe to keep only the common columns
+all_files_newThreshold <- lapply(all_files_newThreshold, function(df) df[, common_cols, drop = FALSE])
+all_files_newThreshold_new <- lapply(all_files_newThreshold_new, function(df) df[, common_cols, drop = FALSE])
+# Step 3: Merge all dataframes by binding rows
+all_df_newThreshold <- do.call(bind_rows, all_files_newThreshold)
+all_df_newThreshold_new <- do.call(bind_rows, all_files_newThreshold_new)
+
+
+# Export the combined data frame
+write.xlsx(all_df_newThreshold, file.path(outdir, "eval_compare_newThreshold.xlsx"), rowNames = FALSE)
+write.xlsx(all_files_newThreshold_new, file.path(outdir, "eval_compare_newThreshold_new.xlsx"), rowNames = FALSE)
+```
+
+
+
+
+
+# Evaluating the predictions
+
+## Original threshold
+
+40%, 60% threshold (probability of accept)
+
+Confusion matrix
+```{r echo=FALSE}
+# confusion matrix before changing the labels
+#table(all_df_newThreshold$Evaluation_pred, all_df_newThreshold$Evaluation)
+
+# Change Evaluation "Pending" into "Reject"
+# Remove Evaluation_pred "Pending"s (since it means NAs present, unable to make prediction)
+all_df_eval <- all_df %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation)) %>% 
+  filter(Evaluation_pred != "Pending")
+
+# Ensure the columns are factors
+all_df_eval <- all_df_eval %>%
+  mutate(
+    Evaluation_pred = factor(Evaluation_pred),
+    Evaluation = factor(Evaluation)
+  )
+
+# Create confusion matrix
+confusion_matrix_ori <- all_df_eval %>%
+  conf_mat(truth = Evaluation, estimate = Evaluation_pred)
+
+# Print the confusion matrix
+print(confusion_matrix_ori)
+```
+
+```{r}
+# with 4 new cases added
+# Change Evaluation "Pending" into "Reject"
+# Remove Evaluation_pred "Pending"s (since it means NAs present, unable to make prediction)
+all_df_eval_new <- all_df_new %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation)) %>% 
+  filter(Evaluation_pred != "Pending")
+
+# Ensure the columns are factors
+all_df_eval_new <- all_df_eval_new %>%
+  mutate(
+    Evaluation_pred = factor(Evaluation_pred),
+    Evaluation = factor(Evaluation)
+  )
+
+# Create confusion matrix
+confusion_matrix_ori_new <- all_df_eval_new %>%
+  conf_mat(truth = Evaluation, estimate = Evaluation_pred)
+
+# Print the confusion matrix
+print(confusion_matrix_ori_new)
+```
+
+
+How to evaluate this? 
+
+```{r}
+paste0("Sensitivity for Accept: ", round(34/(34+1+7), 3))
+
+paste0("Sensitivity for Reject: ", round(92/(1+92+9), 3))
+```
+
+## New threshold
+
+20%, 60% threshold (probability of accept) -- shrink Reject pile, expand review pile
+
+Confusion matrix
+```{r echo=FALSE}
+# confusion matrix before changing the labels
+#table(all_df_newThreshold$Evaluation_pred, all_df_newThreshold$Evaluation)
+
+# Change Evaluation "Pending" into "Reject"
+# Remove Evaluation_pred "Pending"s (since it means NAs present, unable to make prediction)
+all_df_newThreshold_eval <- all_df_newThreshold %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation)) %>% 
+  filter(Evaluation_pred != "Pending")
+
+# Ensure the columns are factors
+all_df_newThreshold_eval <- all_df_newThreshold_eval %>%
+  mutate(
+    Evaluation_pred = factor(Evaluation_pred),
+    Evaluation = factor(Evaluation)
+  )
+
+# Create confusion matrix
+confusion_matrix_new <- all_df_newThreshold_eval %>%
+  conf_mat(truth = Evaluation, estimate = Evaluation_pred)
+
+# Print the confusion matrix
+print(confusion_matrix_new)
+```
+
+```{r}
+# Change Evaluation "Pending" into "Reject"
+# Remove Evaluation_pred "Pending"s (since it means NAs present, unable to make prediction)
+all_df_newThreshold_eval_new <- all_df_newThreshold_new %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation)) %>% 
+  filter(Evaluation_pred != "Pending")
+
+# Ensure the columns are factors
+all_df_newThreshold_eval_new <- all_df_newThreshold_eval_new %>%
+  mutate(
+    Evaluation_pred = factor(Evaluation_pred),
+    Evaluation = factor(Evaluation)
+  )
+
+# Create confusion matrix
+confusion_matrix_new <- all_df_newThreshold_eval_new %>%
+  conf_mat(truth = Evaluation, estimate = Evaluation_pred)
+
+# Print the confusion matrix
+print(confusion_matrix_new)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Remove "good" predictions
+Remove rows where values in "Evaluation_pred" is equivalent to values in "Evaluation"; 
+Remove rows if "Evaluation_pred" is "Reject", AND "Evaluation" is "Pending"; 
+Remove rows if "Evaluation_pred" is "Pending"
+
+```{r eval=FALSE, include=FALSE}
+filtered_df <- all_df %>%
+  filter(
+    # Remove rows where values in "Evaluation_pred" are equivalent to values in "Evaluation"
+    Evaluation_pred != Evaluation,
+    
+    # Remove rows if "Evaluation_pred" is "Reject" AND "Evaluation" is "Pending"
+    !(Evaluation_pred == "Reject" & Evaluation == "Pending"),
+    
+    # Remove rows if "Evaluation_pred" is "Pending"
+    Evaluation_pred != "Pending"
+  )
+
+write.xlsx(filtered_df, file.path(outdir, "filtered_eval_compare.xlsx"), rowNames = FALSE)
+```
+
+
+The predicted "Accept" were quite accurate. But not for the predicted "Rejects". 
+For peptides that were predicted as "Reject", but actually "Accept", pull their features out and see what happened
+```{r eval=FALSE, include=FALSE}
+# filter the all_df where Evaluation_pred == "Reject" and Evaluation == "Accept"
+wrong_reject_df <- all_df %>% 
+  filter(Evaluation_pred == "Reject" & Evaluation == "Accept")
+```
+
+
+```{r eval=FALSE}
+feature_dir <- here("output", "05-2_cleaning_prediction.Rmd")
+patient_id_test <- fnames[1]
+cleaned_file_path <-
+    list.files(feature_dir, 
+               pattern = paste0("^.*", patient_id_test, ".*\\.RDS$"), 
+               full.names = TRUE)
+
+cleaned_data <- readRDS(cleaned_file_path)
+
+wrong_peptide_id <- wrong_reject_df %>% 
+  filter(patient_id == patient_id_test) %>% 
+  pull(ID)
+
+cleaned_data %>% 
+  filter(ID %in% wrong_peptide_id) %>% 
+  mutate(patient_id = patient_id_test)
+```
+
+Function to get features for the wrongly predicted peptides. 
+```{r eval=FALSE, include=FALSE}
+wrong_predict_rej <-
+  function(patient_id_wrong,
+           feature_dir,
+           wrong_reject_df) {
+    cleaned_file_path <-
+      list.files(
+        feature_dir,
+        pattern = paste0("^.*", patient_id_wrong, ".*\\.RDS$"),
+        full.names = TRUE
+      )
+    cleaned_data <- readRDS(cleaned_file_path)
+    
+    wrong_peptide_id <- wrong_reject_df %>%
+      filter(patient_id == patient_id_wrong) %>%
+      pull(ID)
+    
+    cleaned_data %>%
+      filter(ID %in% wrong_peptide_id) %>%
+      mutate(patient_id = patient_id_wrong)
+  }
+```
+
+```{r eval=FALSE, include=FALSE}
+# Apply the function to each file and combine the results into a list of dataframes
+wrong_rej_dfs <- lapply(fnames, 
+                     wrong_predict_rej, 
+                     feature_dir = here("output", "05-2_cleaning_prediction.Rmd"), 
+                     wrong_reject_df = wrong_reject_df)
+
+# Combine all the dataframes into a single dataframe
+all_wrong_rej <- do.call(bind_rows, wrong_rej_dfs) # contains all features of these peptides
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# add the predicted probabilities to this df
+all_wrong_rej_pred <- full_join(wrong_reject_df, 
+          all_wrong_rej %>% select(-c(Evaluation)), 
+          by=c("ID", "patient_id"))
+write.xlsx(all_wrong_rej_pred, file.path(outdir, "pred_rej_wrong.xlsx"), rowNames = FALSE)
+saveRDS(all_wrong_rej_pred, file.path(outdir, "pred_rej_wrong.RDS"))
+```
+
+
+
+Combine all 4 patient's pepdide features and their predictions, export
+```{r eval=FALSE, include=FALSE}
+# Apply the function to each file and combine the results into a list of dataframes
+all_dfs <- lapply(fnames, 
+                     wrong_predict_rej, 
+                     feature_dir = here("output", "05-2_cleaning_prediction.Rmd"), 
+                     wrong_reject_df = all_df)
+
+# Combine all the dataframes into a single dataframe
+all_combined <- do.call(bind_rows, all_dfs) # contains all features of these peptides
+
+# add the predicted probabilities to this df
+all_feature_pred <- full_join(all_df, 
+          all_combined %>% select(-c(Evaluation)), 
+          by=c("ID", "patient_id"))
+saveRDS(all_feature_pred, file.path(outdir, "validation_pred.RDS"))
+```
+

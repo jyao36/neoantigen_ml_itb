@@ -1,0 +1,322 @@
+---
+title: "Cleaning and Imputation"
+author: "Jennie Yao"
+date: "2023-10-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+library(randomForest)
+library(openxlsx) # save excel file
+library(missForest) # random forest missing value imputation
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "05_cleaning_imputation.Rmd")
+fs::dir_create(outdir)
+```
+
+**NOTE: This file is for training samples only! Not used during prediction (for prediction use script 05-2_cleaning_prediciton.Rmd)**
+
+Run this after  `04_reduce_columns_for_training.Rmd`
+
+Goal:  
+
+* Merge all patient's data into one  
+* Impute missing NA values
+* Merge samples together for later training and testing
+
+
+OUTCOME: 
+Output file: `df_imputed.rds`; `df_imputed.xlsx`
+
+
+
+Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that will be used in the ML study
+```{r extract patient list}
+patient_id_list <- meta %>% 
+  filter(include_ML == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+print(paste0("Number of patient included in analysis: ", length(patient_id_list)))
+```
+
+# Merge all patient data 
+
+```{r define merge_files_ml function, include=FALSE}
+# Function to extract each file from the directory and extract ID
+merge_files_ml <- function(patient_id_test, in_dir) {
+  # in_dir = folder path that has all reduced columns files 
+  
+  # read files through patient id
+  #reduced_file_path <- in_dir
+  reduced_file_path <-
+    list.files(in_dir, 
+               pattern = paste0("^.*", patient_id_test, ".*\\.RDS$"), 
+               full.names = TRUE) #%>%
+    #grep(patient_id_test, ., value = TRUE) 
+  
+  # change to read RDS instead of tsv
+  #reduced_data <- read.delim(reduced_file_path, header = TRUE) %>% 
+    #mutate(patient_id = patient_id_test)
+  reduced_data <- readRDS(reduced_file_path) %>% 
+    mutate(patient_id = patient_id_test) # paste each patient's id in the file
+  
+  
+  reduced_data
+}
+```
+
+```{r test merge_files_ml function, eval=FALSE, include=FALSE}
+merge_files_ml("TWJF-5120-04", 
+               in_dir = file.path(here(), "output", "04_reduce_columns_for_training.Rmd"))
+```
+
+
+Read and merge patient data
+```{r merge patient data, include=FALSE}
+# Apply the function to each file and combine the results into a list of dataframes
+all_files <- lapply(patient_id_list, 
+                    merge_files_ml, 
+                    in_dir = file.path(here(), "output", "04_reduce_columns_for_training.Rmd"))
+
+# Combine all the dataframes into a single dataframe
+merged_df <- do.call(bind_rows, all_files)
+
+df_ml <- merged_df %>% 
+  select(-Percentile.Fail) %>% 
+  mutate(
+      Prob.match = factor(Prob.match, levels = 0:1, labels = c("NO", "YES")),
+      Ref.Match = factor(Ref.Match, levels = 0:1, labels = c("FALSE", "TRUE")),
+      TSL = as.factor(TSL),
+      driver_gene = factor(driver_gene, levels = 0:1, labels = c("NO", "YES")),
+      #Evaluation = factor(Evaluation, levels = 0:1, labels = c("Reject", "Accept")),
+      Evaluation = factor(Evaluation, levels = unique(Evaluation)),
+      Biotype = factor(Biotype, levels = unique(Biotype)), 
+      Variant.Type = factor(Variant.Type, levels = unique(Variant.Type))
+    )
+#colnames(df_ml)
+```
+
+**PVACseq version problem**
+
+Different versions of PVACseq made different versions of output with different column names. 
+
+Later versions seem to make column names with "IC50" in the names (e.g. "MHCflurry.WT.IC50.Score" instead of MHCflurry.WT.Score"). The codes below changes column names to add "IC50" if they don't have it.
+
+Within some patiants that have most columns with "IC50", they had "NetMHCpanEL.WT.IC50.Score", "NetMHCpanEL.MT.IC50.Score" without the "IC50"
+
+Could consider running ALL patient data with the newest version of PVACseq?
+
+```{r new function to unify column names}
+# a list of column names that contains "IC50"
+col_names_keep1 <- c("NetMHCpanEL.WT.IC50.Score", "NetMHCpanEL.MT.IC50.Score") # this is changed for all files
+col_names_keep2 <- setdiff(colnames(df_ml)[76:93], col_names_keep1)
+
+# save these for 05-2_cleaning_prediction.Rmd
+saveRDS(col_names_keep1, file = file.path(outdir, "col_names_keep1.RDS"))
+saveRDS(col_names_keep2, file = file.path(outdir, "col_names_keep2.RDS"))
+
+# Function to process each file and extract ID AND change column names
+merge_files_ml2 <- function(patient_id_test, in_dir) {
+  # in_dir = folder path for the reduced column files
+  
+  # read files through patient id
+  reduced_file_path <-
+    list.files(in_dir, 
+               pattern = paste0("^.*", patient_id_test, ".*\\.RDS$"), 
+               full.names = TRUE) 
+  reduced_data <- readRDS(reduced_file_path) %>% 
+    mutate(patient_id = patient_id_test)
+  
+  #
+  #reduced_file_path <- in_dir
+  #reduced_file_path <-
+    #list.files(reduced_file_path, full.names = TRUE) %>%
+    #grep(patient_id_test, ., value = TRUE)
+
+  #reduced_data <- read.delim(reduced_file_path, header = TRUE) %>%
+    #mutate(patient_id = patient_id_test) 
+  
+  if (!any(colnames(reduced_data) %in% col_names_keep1)) {
+    reduced_data <- reduced_data %>%
+      rename(
+        "NetMHCpanEL.WT.IC50.Score" = "NetMHCpanEL.WT.Score",
+        "NetMHCpanEL.MT.IC50.Score" = "NetMHCpanEL.MT.Score",
+      )
+  }
+  
+  if (!any(colnames(reduced_data) %in% col_names_keep2)) {
+    reduced_data <- reduced_data %>%
+      rename(
+        "MHCflurry.WT.IC50.Score" = "MHCflurry.WT.Score",
+        "MHCflurry.MT.IC50.Score" = "MHCflurry.MT.Score",
+        "MHCnuggetsI.WT.IC50.Score" = "MHCnuggetsI.WT.Score",
+        "MHCnuggetsI.MT.IC50.Score" = "MHCnuggetsI.MT.Score",
+        "NetMHC.WT.IC50.Score" = "NetMHC.WT.Score", 
+        "NetMHC.MT.IC50.Score" = "NetMHC.MT.Score",
+        "NetMHCcons.WT.IC50.Score" = "NetMHCcons.WT.Score", 
+        "NetMHCcons.MT.IC50.Score" = "NetMHCcons.MT.Score", 
+        "NetMHCpan.WT.IC50.Score" = "NetMHCpan.WT.Score", 
+        "NetMHCpan.MT.IC50.Score" = "NetMHCpan.MT.Score", 
+         
+        "PickPocket.WT.IC50.Score" = "PickPocket.WT.Score", 
+        "PickPocket.MT.IC50.Score" = "PickPocket.MT.Score", 
+        "SMM.WT.IC50.Score" = "SMM.WT.Score", 
+        "SMM.MT.IC50.Score" = "SMM.MT.Score",
+        "SMMPMBEC.WT.IC50.Score" = "SMMPMBEC.WT.Score", 
+        "SMMPMBEC.MT.IC50.Score" = "SMMPMBEC.MT.Score"
+      )
+  }
+  
+  reduced_data
+}
+```
+
+
+```{r merge new dataframe with unified column names}
+# Apply the function to each file and combine the results into a list of dataframes
+all_files2 <- lapply(patient_id_list, 
+                     merge_files_ml2, 
+                     in_dir = file.path(here(), "output", "04_reduce_columns_for_training.Rmd"))
+
+# Combine all the dataframes into a single dataframe
+merged_df2 <- do.call(bind_rows, all_files2)
+
+df_ml2 <- merged_df2 %>% 
+  select(-Percentile.Fail) %>% 
+  mutate(
+      Prob.match = factor(Prob.match, levels = 0:1, labels = c("NO", "YES")),
+      Ref.Match = factor(Ref.Match, levels = 0:1, labels = c("FALSE", "TRUE")),
+      TSL = as.factor(TSL),
+      driver_gene = factor(driver_gene, levels = 0:1, labels = c("NO", "YES")),
+      #Evaluation = factor(Evaluation, levels = 0:1, labels = c("Reject", "Accept")),
+      Evaluation = factor(Evaluation, levels = unique(Evaluation)), 
+      Biotype = factor(Biotype, levels = unique(Biotype)), 
+      Variant.Type = factor(Variant.Type, levels = unique(Variant.Type))
+    )
+
+```
+
+For prediction data purposes
+```{r}
+levels_list <-
+  list(
+    TSL = levels(df_ml2$TSL),
+    Biotype = levels(df_ml2$Biotype),
+    Variant.Type = levels(df_ml2$Variant.Type)
+  )
+saveRDS(levels_list, file = file.path(outdir, "levels_list.RDS"))
+```
+
+
+```{r new data dimension}
+df_ml2 %>% na.omit() %>% dim()
+```
+
+
+```{r Evaluation class break down}
+df_ml2 %>% na.omit() %>% select(Evaluation) %>% summary()
+```
+
+
+```{r save processed data, include=FALSE}
+write.table(df_ml2, file = file.path(outdir, "merged_df_ml2.tsv"), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+write.xlsx(df_ml2, file = here(outdir, "merged_df_ml2.xlsx"))
+```
+
+
+# Imputation
+
+## Replace with existing values
+
+* `IC50.WT.class1` -> `NetMHC.WT.IC50.Score`, `SMM.WT.IC50.Score`, `SMMPMBEC.WT.IC50.Score`
+* `IC50.MT.class1` -> `NetMHC.MT.IC50.Score`, `SMM.MT.IC50.Score`, `SMMPMBEC.MT.IC50.Score`
+* `percentile.WT.class1` -> `NetMHC.WT.Percentile`, `SMM.WT.Percentile`, 
+`SMMPMBEC.WT.Percentile`
+* `percentile.MT.class1` -> `NetMHC.MT.Percentile`, `SMM.MT.Percentile`, `SMMPMBEC.MT.Percentile`
+
+```{r replace NA with existing values}
+df_ml2_replace <- df_ml2 %>%
+  mutate(
+    NetMHC.WT.IC50.Score = if_else(is.na(NetMHC.WT.IC50.Score), IC50.WT.class1, NetMHC.WT.IC50.Score),
+    SMM.WT.IC50.Score = if_else(is.na(SMM.WT.IC50.Score), IC50.WT.class1, SMM.WT.IC50.Score),
+    SMMPMBEC.WT.IC50.Score = if_else(is.na(SMMPMBEC.WT.IC50.Score), IC50.WT.class1, SMMPMBEC.WT.IC50.Score),
+    NetMHC.MT.IC50.Score = if_else(is.na(NetMHC.MT.IC50.Score), IC50.MT.class1, NetMHC.MT.IC50.Score),
+    SMM.MT.IC50.Score = if_else(is.na(SMM.MT.IC50.Score), IC50.MT.class1, SMM.MT.IC50.Score),
+    SMMPMBEC.MT.IC50.Score = if_else(is.na(SMMPMBEC.MT.IC50.Score), IC50.MT.class1, SMMPMBEC.MT.IC50.Score),
+    NetMHC.WT.Percentile = if_else(is.na(NetMHC.WT.Percentile), percentile.WT.class1, NetMHC.WT.Percentile),
+    SMM.WT.Percentile = if_else(is.na(SMM.WT.Percentile), percentile.WT.class1, SMM.WT.Percentile),
+    SMMPMBEC.WT.Percentile = if_else(is.na(SMMPMBEC.WT.Percentile), percentile.WT.class1, SMMPMBEC.WT.Percentile),
+    NetMHC.MT.Percentile = if_else(is.na(NetMHC.MT.Percentile), percentile.MT.class1, NetMHC.MT.Percentile),
+    SMM.MT.Percentile = if_else(is.na(SMM.MT.Percentile), percentile.MT.class1, SMM.MT.Percentile),
+    SMMPMBEC.MT.Percentile = if_else(is.na(SMMPMBEC.MT.Percentile), percentile.MT.class1, SMMPMBEC.MT.Percentile)
+  )
+write.xlsx(df_ml2_replace, file = here(outdir, "merged_df_ml2_replace.xlsx"))
+```
+
+
+## Imputation for frame-shift (FS) variants 
+
+Use random forest to impute remaining missing values for FS variants 
+How missForest Works:
+	1.	Initial Imputation: It starts by filling missing values with initial guesses (e.g., using the mean for numeric variables and the most frequent category for categorical variables).
+	2.	Iterative Random Forests:
+	    It iterates over each variable with missing values and treats it as the response variable (Y).
+	    The other observed variables (both numerical and categorical) are used as predictors (X).
+	    A Random Forest model is trained on the observed data of Y, and then it predicts missing values.
+	    The imputed values replace the missing ones, and the process repeats for all variables with missing data.
+	3.	Convergence Check: The imputation process is repeated iteratively until the imputed values stabilize, meaning there is minimal change between iterations.
+
+```{r}
+# check the columns that have NAs
+colnames(df_ml2_replace)[colSums(is.na(df_ml2_replace)) > 0]
+
+# Apply missForest to impute missing values in training set
+# Exclude, ID, patient_id, and Evaluation columns during imputation
+set.seed(918)
+imputed_df <- missForest(df_ml2_replace[, 4:ncol(df_ml2_replace)-1])
+
+# Extract the imputed dataset
+df_ml2_impute <- imputed_df$ximp
+```
+
+```{r}
+# paste the ID, patient_id back to the imputed value
+columns_to_join <- c("ID", "patient_id", "Evaluation")
+df_final <- bind_cols(df_ml2_replace[columns_to_join], df_ml2_impute)
+```
+
+```{r}
+saveRDS(df_final, file = here(outdir, "df_imputed.rds"))
+write.xlsx(df_final, file = here(outdir, "df_imputed.xlsx"))
+```
+
+
+
+
+
+
+
+
+
+OLD function: not used anymore
+```{r OLD: random forest imputation, eval=FALSE, include=FALSE}
+# rfImpute only take numeric/factor variables, need to exclude ID and patient_id
+df_ml2_impute <- rfImpute(df_ml2_replace[, 3:ncol(df_ml2_replace)-1], df_ml2_replace$Evaluation)
+```
+

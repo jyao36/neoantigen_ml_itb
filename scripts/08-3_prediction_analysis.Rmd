@@ -1,0 +1,126 @@
+---
+title: "Wrong predictions analysis after threshold adjustment"
+author: "Jennie Yao"
+date: "2024-12-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(here)
+library(openxlsx)
+library(gridExtra)
+library(ggpubr)
+```
+
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "08-3_prediction_analysis.Rmd")
+fs::dir_create(outdir)
+```
+
+After adjusting the threshold for predicitons (`08_randomForest_predict.Rmd`) and looking at the performance confusion matrix (`08-1_threshold_adj.Rmd`), which was an iterative process, The new threshold produced some predicitons in which some peptides were predicted as `Reject` but in fact should have been `Review`. Ideally we still want to look at these peptides to make sure we are not missing important ones. 
+
+This script pulls the Manual Review comments of these peptides and analyze them whether these were worthwhile peptides. 
+
+**NOTE: only joining the comments after the Manual Review since the ITB Evaluation may be changed after manual revision**
+
+# Combine predicted and true evaluation from these files
+```{r}
+fnames <- c("5120-16", "5120-17", "5120-18", "5120-19") # patient ID
+fnames_new <- c("5120-16", "5120-17", "5120-18", "5120-19", "5120-39", "CTEP-10146-MD017-0052", "G110_Region1", "G110_Region2", "G113_Region1")
+pred_dir <- here("output", "08-1_threshold_adj.Rmd") # random forest predictions
+manual_review_dir <- here("data", "files_for_prediction", "with_manual_review_comments") # the itb file after the manual review process
+```
+
+Function to merge itb reviewed file, true Evaluation, and predicted Evaluations, probabilities, manual review comments, and final Evaluation decision together into one file for analysis
+
+```{r}
+merge_pred_eval_comments <- function(patient_id, pred_dir, manual_review_dir, outdir) {
+  # Locate and read prediction file (that has prediction, probabilities, and actual Evaluations)
+  predict_files <- list.files(pred_dir, full.names = TRUE)
+  predict_file_path <- grep(paste0(patient_id, ".*predict&trueEval_newThreshold.*\\.tsv$"), predict_files, value = TRUE)
+  
+  if (length(predict_file_path) == 0) {
+    stop(paste("No prediction file found for patient:", patient_id))
+  }
+  # Check if exactly one prediction file is found
+  if (length(predict_file_path) != 1) {
+    stop(paste("Error: Found", length(predict_file_path), "prediction files for patient ID:", patient_id,
+               "\nPlease ensure there is exactly one matching prediction file."))
+  }
+  
+  predict_file <- read.delim(predict_file_path)
+  
+  # Locate and read evaluation file
+  manual_review_files <- list.files(manual_review_dir, full.names = TRUE)
+  manual_review_file_path <- grep(patient_id, manual_review_files, value = TRUE)
+  
+  if (length(manual_review_file_path) == 0) {
+    stop(paste("No evaluation file found for patient:", patient_id))
+  }
+  # Check if exactly one manual review file is found
+  if (length(manual_review_file_path) != 1) {
+    stop(paste("Error: Found", length(manual_review_file_path), "manual review files for patient ID:", patient_id,
+               "\nPlease ensure there is exactly one matching manual review file."))
+  }
+  
+  manual_review_file <- read.xlsx(manual_review_file_path) %>% 
+    rename(final_Evaluation = Evaluation)
+  # columns of comments: pVAC.Review.Comments, IGV.Review.Comments
+  
+  # Merge prediction and evaluation data
+  merged_df_export <- left_join(
+    predict_file,
+    manual_review_file %>% select(
+      "ID",
+      "final_Evaluation",
+      "pVAC.Review.Comments",
+      "IGV.Review.Comments"
+    ),
+    by = "ID"
+  ) %>%
+    mutate(patient_id = patient_id) %>%
+    mutate(Pos = if (is.integer(Pos))
+      as.character(Pos)
+      else
+        Pos) %>% # make sure Pos is always type chr, sometimes it gets converted to int and messes up merging in the do.call step 
+    mutate(Ref.Match = if (!is.character(Ref.Match))
+      as.character(Ref.Match)
+      else
+        Ref.Match)
+  
+  # Export merged data frame as excel format
+  out_name = paste0(patient_id, "_", "predict&trueEval&manualComments.xlsx")
+  write.xlsx(merged_df_export, 
+             file = file.path(outdir, out_name)
+  )
+  
+  # Return the merged data frame
+  return(merged_df_export)
+}
+
+# Process all files
+all_files <- lapply(fnames_new, merge_pred_eval_comments, pred_dir, manual_review_dir, outdir)
+
+# Combine all data frames
+all_df <- do.call(bind_rows, all_files)
+
+# Export the combined data frame
+write.xlsx(all_df, file.path(outdir, "all_predict&trueEval&manualComments.xlsx"), rowNames = FALSE)
+```
+
+Filter for peptides which are predicted to be "Reject" but are actually marked as "Review"
+
+```{r}
+problematic_rejects <- all_df %>% 
+  filter(Evaluation_pred == "Reject" & Evaluation == "Review")
+
+# Export the combined data frame
+write.xlsx(problematic_rejects, file.path(outdir, "problematic_rejects.xlsx"), rowNames = FALSE)
+```
+

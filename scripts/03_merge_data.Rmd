@@ -1,0 +1,259 @@
+---
+title: "Merge data"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(parallel)
+library(data.table)
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "03_merge_data.Rmd")
+fs::dir_create(outdir)
+```
+
+
+Run this after `02_make_meta2.Rmd`
+
+UPDATE: This script applies for ML study  AND external validation 
+
+Goal: 
+
+Merge the three documents from each patient using patient_id from metadata. 
+
+The three documents include: itb_review, all_epitopes, class2
+
+* ITB review file - has all the rows we want for training and testing
+* all_epitopes file - has additional columns we want to include
+* Class 2 file - has additional columns on class 2 to include 
+  - In this version only included the columns on alleles, not the remaining columns
+  - Include Best Peptide, Best Transcript, IC50MT, IC50WT, %ileMT, %ileWT (rename these columns for class2 to incorporate to itb_review file, which has another set of these columns)
+
+
+
+OUTCOME:  
+Output file: `patient_id_merged.tsv` files in output directory.  
+
+
+
+# Load data
+Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that will be used in the ML study & external prediction
+```{r}
+patient_id_list <- meta %>% 
+  filter(include_ML == "Yes" | external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+```
+
+
+Get the files via patient_id
+
+```{r proof of concept, eval=FALSE, include=FALSE}
+# This chunk is for building the below function
+
+patient_id <- "CTEP-10146-MD017-0052"
+project_dir <- here()
+
+# Find the patient's file using grep
+matching_files <- list.files(file.path(project_dir, "data", "itb_review"), 
+                              pattern = paste0("^.*", patient_id, ".*\\.tsv$"))
+  
+if (length(matching_files) == 0) {
+  cat("Patient ID", patient_id, "not found in the directory. Skipping...\n")
+  return(NULL)
+}
+
+
+# get files through patient id
+itb_path <- file.path(project_dir, "data", "itb_review")
+itb_file_path <- list.files(itb_path, pattern = paste0("^.*", patient_id, ".*\\.tsv$"), 
+                            full.names = TRUE) #%>% 
+    #grep(patient_id, ., value = TRUE)
+itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t") %>% 
+  rename(Best.Peptide.class1 = Best.Peptide, 
+         Best.Transcript.class1 = Best.Transcript, 
+         IC50.MT.class1 = IC50.MT, 
+         IC50.WT.class1 = IC50.WT, 
+         percentile.MT.class1 = X.ile.MT, 
+         percentile.WT.class1= X.ile.WT)
+
+epi_path <- file.path(project_dir, "data", "all_epitopes")
+epi_file_path <- list.files(epi_path, full.names = TRUE) %>% 
+    grep(patient_id, ., value = TRUE)
+epi_file <- read.table(epi_file_path, header = TRUE, sep = "\t") 
+
+c2_path <- file.path(project_dir, "data", "class2")
+c2_file_path <- list.files(c2_path, full.names = TRUE) %>% 
+    grep(patient_id, ., value = TRUE)
+c2_file <- read.table(c2_file_path, header = TRUE, sep = "\t") %>% 
+  rename(Best.Peptide.class2 = Best.Peptide, 
+         Best.Transcript.class2 = Best.Transcript, 
+         IC50.MT.class2 = IC50.MT, 
+         IC50.WT.class2 = IC50.WT, 
+         percentile.MT.class2 = X.ile.MT, 
+         percentile.WT.class2 = X.ile.WT) %>%
+  select(ID, starts_with("D"), -DNA.VAF, 
+         Best.Peptide.class2, Best.Transcript.class2, 
+         IC50.MT.class2, IC50.WT.class2, 
+         percentile.MT.class2, percentile.WT.class2)
+#colnames(c2_file)
+
+# check if itb_file and c2_file have the same number of rows
+if (nrow(itb_file) == nrow(c2_file)){
+  warning("test itb_file match rows of c2_file")
+}
+
+# join class2 file to itb file
+itb_c2 <- merge(x = itb_file, y = c2_file, by = "ID")
+
+# join epi file columns to itb_c2
+itb_c2_epi <- itb_c2 %>%
+  # Split the ID column in itb_c2 into separate columns
+  separate(ID, c("Chromosome", "Start", "Stop", "Reference", "Variant"), sep = "-", remove = FALSE) %>%
+  mutate(Start = as.integer(Start), 
+         Stop = as.integer(Stop)) %>%
+  # match the epi_file rows to itb_c2 via the following columns
+  inner_join(., epi_file, by = c("Chromosome" = "Chromosome", 
+                                 "Start" = "Start", 
+                                 "Stop" = "Stop", 
+                                 "Reference" = "Reference", 
+                                 "Variant" = "Variant", 
+                                 "Best.Transcript.class1" = "Transcript", 
+                                 "Best.Peptide.class1" = "MT.Epitope.Seq", 
+                                 "Allele" = "HLA.Allele")) %>% 
+  # remove the redundant folumns that were made from splitting ID
+  select(-c("Chromosome", "Start", "Stop", "Reference", "Variant"))
+
+
+itb_c2_epi
+dim(itb_c2_epi)
+# check that the row numbers match
+dim(itb_c2_epi)[1] == nrow(itb_file)
+```
+
+
+Put the above into a function 
+
+* Input: patient_id (from metadata); project directory (should be at "Neoantigen ML project" level)
+* Output: a merged data frame saved to the output directory
+
+```{r merge df function}
+merge_patient_df <- function(patient_id, project_dir, out_dir){
+
+  # Find the patient's file in itb_review folder using grep
+  matching_files <- list.files(file.path(project_dir, "data", "itb_review"), 
+                               pattern = paste0("^.*", patient_id, ".*\\.tsv$"))
+  
+  # if the patient's file does not exist, print a message and skip
+  if (length(matching_files) == 0) {
+    cat("Patient ID", patient_id, "not found in the directory. Skipping...\n")
+    return(NULL)
+  } else{
+    cat("Patient ID", patient_id, "merging files\n")
+  }
+  
+  # get files through patient id
+  itb_path <- file.path(project_dir, "data", "itb_review")
+  itb_file_path <- list.files(itb_path, full.names = TRUE, 
+                              pattern = paste0("^.*", patient_id, ".*\\.tsv$")) #%>% 
+    #grep(patient_id, ., value = TRUE)
+  itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t") %>% 
+    rename(
+      Best.Peptide.class1 = Best.Peptide,
+      Best.Transcript.class1 = Best.Transcript,
+      IC50.MT.class1 = IC50.MT,
+      IC50.WT.class1 = IC50.WT,
+      percentile.MT.class1 = X.ile.MT,
+      percentile.WT.class1 = X.ile.WT
+    )
+  
+  epi_path <- file.path(project_dir, "data", "all_epitopes")
+  epi_file_path <- list.files(epi_path, full.names = TRUE) %>% 
+     grep(patient_id, ., value = TRUE)
+  epi_file <- read.table(epi_file_path, header = TRUE, sep = "\t") 
+  
+  c2_path <- file.path(project_dir, "data", "class2")
+  c2_file_path <- list.files(c2_path, full.names = TRUE) %>% 
+      grep(patient_id, ., value = TRUE)
+  c2_file <- read.table(c2_file_path, header = TRUE, sep = "\t") %>% 
+    rename(
+      Best.Peptide.class2 = Best.Peptide,
+      Best.Transcript.class2 = Best.Transcript,
+      IC50.MT.class2 = IC50.MT,
+      IC50.WT.class2 = IC50.WT,
+      percentile.MT.class2 = X.ile.MT,
+      percentile.WT.class2 = X.ile.WT
+    ) %>% 
+    select(ID, starts_with("D"), -DNA.VAF, 
+          Best.Peptide.class2, Best.Transcript.class2, 
+          IC50.MT.class2, IC50.WT.class2, 
+          percentile.MT.class2, percentile.WT.class2)
+  
+  # check if itb_file and c2_file have the same number of rows
+  if (nrow(itb_file) != nrow(c2_file)){
+     warning("itb_review file and class2 file rows DO NOT match, but continue processing...\n")
+  } 
+  
+  # join class2 file to itb file
+  itb_c2 <- merge(x = itb_file, y = c2_file, by = "ID")
+  
+  # join epi file columns
+  itb_c2_epi <- itb_c2 %>%
+    # Split the ID column in itb_c2 into separate columns
+    separate(ID, c("Chromosome", "Start", "Stop", "Reference", "Variant"),
+      sep = "-",
+      remove = FALSE) %>%
+    mutate(Start = as.integer(Start),
+           Stop = as.integer(Stop)) %>%
+    # match the epi_file rows to itb_c2 via the following columns
+    inner_join(., epi_file,
+      by = c(
+        "Chromosome" = "Chromosome",
+        "Start" = "Start",
+        "Stop" = "Stop",
+        "Reference" = "Reference",
+        "Variant" = "Variant",
+        "Best.Transcript.class1" = "Transcript",
+        "Best.Peptide.class1" = "MT.Epitope.Seq",
+        "Allele" = "HLA.Allele"
+      )
+    ) %>%
+    # remove the redundant folumns that were made from splitting ID
+    select(-c("Chromosome", "Start", "Stop", "Reference", "Variant"))
+  
+  # check that the row numbers match between the merged file and original itb_file
+  if (dim(itb_c2_epi)[1] != nrow(itb_file)){
+     warning("itb_review file and merged file rows DO NOT match, but continue saving...\n")
+  }
+  
+  # generate file name
+  out_name <- paste0(patient_id, "_", "merged.tsv")
+  # save the output into the outdir
+  write.table(itb_c2_epi, file = file.path(out_dir, out_name), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+}
+```
+
+Test on one file
+```{r test function with one patient, eval=FALSE}
+merge_patient_df("CTEP-10146-MD017-0052", here(), outdir)
+```
+
+Run function on all patients
+```{r merge all patient data}
+patient_id_list
+#lapply(patient_id_list, merge_patient_df, project_dir = here(), out_dir = outdir)
+mclapply(patient_id_list, merge_patient_df, project_dir = here(), out_dir = outdir, mc.cores = 4)
+```
+

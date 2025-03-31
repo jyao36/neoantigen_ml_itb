@@ -1,0 +1,70 @@
+---
+title: "Summary statistics"
+author: "Jennie Yao"
+date: "2025-02-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "summary.Rmd")
+fs::dir_create(outdir)
+```
+
+
+Goal: 
+* To summarize statistics for training and testing sets
+
+
+OUTCOME: 
+Output file: 
+
+
+Read metadata and imputed data (the step right before training and testing)
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+df_imputed <- readRDS(here("output", "05_cleaning_imputation.Rmd", "df_imputed.rds"))
+```
+
+# For knowing how many peptides are in each trial (training + test set)
+This part was added for making the CGC 2024 poster table. I wanted to know how many peptides were in each trial. 
+
+A list of patient_id with the trial name
+```{r extract patient id with the trial name they are from}
+patient_id_trial <- meta %>% 
+  filter(include_ML == "Yes") %>% 
+  select(patient_id, trial, tumor_type)
+```
+
+```{r}
+# add trial names to df_imputed (extra column)
+# Excluding "Review" peptides since they were excluded from model training and testing
+# "Pending" are grouped into "Rejects"
+df_trial <- df_imputed %>% 
+  filter(Evaluation != "Review") %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Accept", 1, 0)) %>% 
+  full_join(., patient_id_trial, by = "patient_id")
+#df_trial <- full_join(df_imputed, patient_id_trial, by = "patient_id")
+
+
+# Group by the 'trial' column and calculate the number of unique patient_id, the number of rows in each group, the number of Accepts, the number of Rejects
+result <- df_trial %>%
+  group_by(trial, tumor_type) %>%
+  summarise(
+    total_patients = n_distinct(patient_id),
+    total_peptides = n(), 
+    count_accept = sum(Evaluation == 1, na.rm = TRUE),
+    count_reject = sum(Evaluation == 0, na.rm = TRUE)
+  )
+
+# Print the result
+print(result)
+```

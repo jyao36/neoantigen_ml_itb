@@ -1,0 +1,21 @@
+"","Variable","Importance"
+"MHCnuggetsI.WT.Percentile","MHCnuggetsI WT Percentile",-2.13785138298956
+"Biotype","Biotype",-1.00124921972504
+"Pos","Position",-0.782276850579159
+"Variant.Type","Variant Type",-0.0953605960755166
+"MHCnuggetsI.WT.IC50.Score","MHCnuggetsI WT IC50 Score",-0.0937285138030267
+"Corresponding.Fold.Change","Corresponding Fold Change",0.108726048941945
+"NetMHCpanEL.WT.Percentile","NetMHCpanEL WT Percentile",0.138165549343162
+"NetMHCpanEL.WT.IC50.Score","NetMHCpanEL WT IC50 Score",0.354869536136743
+"Corresponding.WT.Percentile","Corresponding WT Percentile",0.520761283102596
+"MHCflurryEL.Presentation.WT.Percentile","MHCflurryEL Presentation WT Percentile",0.585847053628848
+"SMM.WT.IC50.Score","SMM WT IC50 Score",0.617646361955868
+"SMMPMBEC.WT.Percentile","SMMPMBEC WT Percentile",0.805085299070219
+"SMMPMBEC.MT.Percentile","SMMPMBEC MT Percentile",0.81791867473808
+"PickPocket.WT.IC50.Score","PickPocket WT IC50 Score",1.02359670377678
+"SMMPMBEC.WT.IC50.Score","SMMPMBEC WT IC50 Score",1.0943128393528
+"NetMHCcons.WT.IC50.Score","NetMHCcons WT IC50 Score",1.49081237386349
+"NetMHC.WT.Percentile","NetMHC WT Percentile",1.57756396801143
+"MHCflurry.MT.Percentile","MHCflurry MT Percentile",1.74673329460905
+"Median.Fold.Change","Median Fold Change",1.75319353910986
+"NetMHC.WT.IC50.Score","NetMHC WT IC50 Score",1.80511534698198

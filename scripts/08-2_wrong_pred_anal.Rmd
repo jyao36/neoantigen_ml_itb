@@ -1,0 +1,390 @@
+---
+title: "Wrong predictions analysis"
+author: "Jennie Yao"
+date: "2024-07-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(here)
+library(openxlsx)
+library(gridExtra)
+library(ggpubr)
+```
+
+Output directory
+```{r set output directory, include=FALSE}
+outdir <- here("output", "08-2_wrong_pred_anal.Rmd")
+fs::dir_create(outdir)
+```
+
+
+**THIS SCRIPT WAS ORIGINALLY BUILD TO ANALYZE FALSE NEGATIVE AND FALSE POSITIVE PEPTIDES AND THEIR FEATURES. BUT SINCE THE THRESHOLD ADJUSTMENT, IT IS NOT LONGER NEEDED.** 
+
+
+
+This script is to analyze the wrong predicted peptides. 
+
+We have three evaluation metric to investigate the false negatives and false positives: 
+
+1. OOB (75% training data)
+2. 25% testing data
+3. 4 external validation patient data 
+
+We want to look at the features of those peptides that were predicted wrong
+
+Report: 
+
+- Confusion matrix
+- False negative feature comparison
+- False positive feature comparison
+
+
+In script 08-1_threshold_adj.Rmd we identified a number of peptides that were predicted to be "Reject" but were accepted by ITB. We would like to investigate the features of these peptides and see how they compare to those that were "Accepts" in the training data. 
+
+
+# Read data
+```{r read data, include=FALSE}
+df_train <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "rf_train.RDS"))
+df_test <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "rf_test.RDS"))
+df_val <- readRDS(file = here("output", "08-1_threshold_adj.Rmd", "validation_pred.RDS"))
+df_wrong <- readRDS(file = here("output", "08-1_threshold_adj.Rmd", "pred_rej_wrong.RDS"))
+
+# oob 
+train_votes_file <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "train_votes.RDS")) 
+# down-sampled random forest model
+rf_downsample <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "rf_downsample.RDS"))
+# prediction on test set 
+rf_pred_downsample <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "rf_pred_downsample.RDS"))
+```
+
+
+# Confusion matrix
+
+OOB (Train data)
+```{r OOB confusion matrix and accuracy, echo=FALSE}
+## OOB predictions
+oob_predictions <- rf_downsample$predicted
+# Confusion matrix for OOB
+train_actual_values <- df_train$Evaluation
+oob_conf_matrix <- table(train_actual_values, oob_predictions)
+print("OOB confusion matrix: ")
+oob_conf_matrix
+
+## OOB accuracy
+oob_accuracy <- ( sum(diag(oob_conf_matrix)) / sum(oob_conf_matrix) ) *100
+paste("OOB accuracy = ", round(oob_accuracy, 3), "%", sep="")
+
+## Calcualte average OOB error rate
+# Extract OOB error rates
+oob_error <- as.data.frame(rf_downsample$err.rate) # oob for each tree
+average_oob <- mean(oob_error$OOB) *100 # same value as the OOB estimate of error rate in rf_downsample
+paste("Average OOB error = ", round(average_oob, 3), "%", sep="")
+
+## Sensitivity
+oob_sensitivity = (oob_conf_matrix[2, 2] / (oob_conf_matrix[2, 2] + oob_conf_matrix[2, 1]))*100
+paste("OOB sensitivity = ", round(oob_sensitivity, 3), "%", sep="")
+
+## Specificity
+oob_specificity = (oob_conf_matrix[1, 1] / (oob_conf_matrix[1, 1] + oob_conf_matrix[1, 2]))*100
+paste("OOB specificity = ", round(oob_specificity, 3), "%", sep="")
+```
+
+
+Test data
+```{r test set confusion matrix, echo=FALSE}
+## Confusion matrix
+test_actual_values <- df_test$Evaluation
+test_conf_matrix <- table(test_actual_values, rf_pred_downsample)
+print("Test set confusion matrix: ")
+test_conf_matrix
+
+## Accuracy
+test_accuracy <- (sum(diag(test_conf_matrix)) / sum(test_conf_matrix) ) *100
+paste("Test set accuracy = ", round(test_accuracy, 3), "%", sep="")
+
+## Sensitivity
+test_sensitivity <-
+  (test_conf_matrix[2,2]/(test_conf_matrix[2,2]+test_conf_matrix[2,1]))*100
+paste("Test set sensitivity = ", round(test_sensitivity, 3), "%", sep="")
+
+## Specificity
+test_specificity <-
+  (test_conf_matrix[1,1]/(test_conf_matrix[1,1]+test_conf_matrix[1,2]))*100
+paste("Test set specificity = ", round(test_specificity, 3), "%", sep="")
+```
+
+External validation  
+
+Note: 
+
+- In the actual Evaluation, Pending is changed to Reject
+- Accuracy is calculated with only numbers of Accept, Reject, and Review in the confusion matrix
+- Sensitivity and Specificity is calculated with only numbers of Accept and Reject
+
+```{r validation set confusion matrix, echo=FALSE}
+# Confusion matrix for external validation data
+df_val1 <- df_val %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Pending", "Reject", Evaluation))
+val_actual_values <- df_val1$Evaluation
+val_predictions <- df_val1$Evaluation_pred
+val_conf_matrix <- table(val_actual_values, val_predictions)
+print("Validation set confusion matrix: ")
+val_conf_matrix
+# version with only Accept and Reject
+df_val2 <- df_val1 %>% 
+  filter(!(Evaluation %in% c("Review", "Pending")) & !(Evaluation_pred %in% c("Review", "Pending")))
+val_actual_values2 <- df_val2$Evaluation
+val_predictions2 <- df_val2$Evaluation_pred
+val_conf_matrix2 <- table(val_actual_values2, val_predictions2)
+print("Validation set confusion matrix without Pending or Review: ")
+val_conf_matrix2
+
+
+## Accuracy not that informative 
+# (add diagonal values of Accept, Reject, Review) / (sum of everything - predicted Pending)
+val_accuracy <- ( sum(val_conf_matrix[1,1], val_conf_matrix[2,3], val_conf_matrix[3,4]) / (sum(val_conf_matrix)-sum(val_conf_matrix[,2])) ) *100
+paste("Validation set accuracy = ", round(val_accuracy, 3), "%", sep="")
+
+## Sensitivity -- excluding Review and Pending 
+val_sensitivity <-
+  (val_conf_matrix[1,1]/(val_conf_matrix[1,1]+val_conf_matrix[1,3]))*100
+paste("Validation set sensitivity = ", round(val_sensitivity), "%", sep="")
+
+## Specificity
+val_specificity <-
+  (val_conf_matrix[2,3]/(val_conf_matrix[2,3]+val_conf_matrix[2,1]))*100
+paste("Validation set specificity = ", round(val_specificity, 3), "%", sep="")
+```
+
+Thoughts:
+
+- OOB and Test sets have more false positives
+- Validation set have more false negatives 
+
+
+
+# Define functions
+
+For numeric variables we plot a side-by-side violin plot
+For categorical variables we plot bar plots 
+
+```{r Functions for plots}
+# Function to create side-by-side violin plots for numeric columns
+plot_numeric_comparison <- function(df, column) {
+  ggplot(df, aes(x = Source, y = .data[[column]], fill = Source)) +
+    geom_violin(trim = FALSE) +
+    #geom_jitter(width = 0.1, size = 0.5, alpha = 0.4) +  # Add jittered points (uncomment if needed)
+    labs(title = column, x = "Source", y = column) +
+    theme_minimal() +
+    theme(legend.position = "none")  # Remove legend
+}
+
+# Function to create side-by-side bar plots for categorical columns
+plot_categorical_comparison <- function(df, column) {
+  ggplot(df, aes(x = .data[[column]], fill = Source)) +
+    geom_bar(position = "dodge") +
+    labs(title = column, x = column, y = "Count") +
+    theme_minimal() +
+    theme(legend.position = "none")  # Remove legend
+}
+```
+
+```{r}
+# Function to save plots to PDF using ggpubr (marrangeGrob always gives an empty page)
+save_plots_to_pdf <- function(plot_list, file_name, nrow = 3, ncol = 2) {
+  num_plots <- length(plot_list)
+  plots_per_page <- nrow * ncol
+  num_pages <- ceiling(num_plots / plots_per_page)
+  
+  pdf_pages <- vector("list", num_pages)
+  
+  for (i in seq(1, num_plots, by = plots_per_page)) {
+    page_plots <- plot_list[i:min(i + plots_per_page - 1, num_plots)]
+    pdf_pages[[ceiling(i / plots_per_page)]] <- ggarrange(plotlist = page_plots, nrow = nrow, ncol = ncol)
+  }
+  
+  ggexport(pdf_pages, filename = file_name)
+}
+```
+
+
+```{r get numeric and categorical columns for plotting}
+# List all column names
+all_columns <- colnames(df_train)
+
+# Remove irrelevant columns
+columns_to_exclude <- c("ID", "patient_id", "Evaluation")
+all_columns <- setdiff(all_columns, columns_to_exclude)
+
+# Separate numeric and categorical columns
+numeric_columns <- all_columns[sapply(df_train[, all_columns], is.numeric)]
+categorical_columns <- all_columns[sapply(df_train[, all_columns], is.factor) | sapply(df_train[, all_columns], is.character)]
+```
+
+
+
+
+# False Negative peptides' features 
+
+
+```{r eval=FALSE, include=FALSE}
+df_train1 <- df_train %>% mutate(Source = "train") %>% filter(Evaluation == "Accept")
+df_wrong1 <- df_wrong %>% 
+  mutate(Source = "validation", 
+         Evaluation = as.factor(Evaluation)) %>% 
+  select(-c(Evaluation_pred, Reject_pred_prob, Accept_pred_prob))
+
+# merge two dataframes 
+combined_train_wrong <- bind_rows(df_train1, df_wrong1)
+```
+
+
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+# Create plots for numeric columns
+numeric_plots <- lapply(numeric_columns, function(col) plot_numeric_comparison(combined_train_wrong, col))
+
+# Create plots for categorical columns
+categorical_plots <- lapply(categorical_columns, 
+                            function(col) plot_categorical_comparison(combined_train_wrong, col))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# Save numeric plots to PDF
+save_plots_to_pdf(numeric_plots, file_name = file.path(outdir, "train_val_numeric_plots.pdf"))
+
+# Save categorical plots to PDF
+save_plots_to_pdf(categorical_plots, file_name = file.path(outdir, "train_val_categorical_plots.pdf"))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+df_test1 <- df_test %>% mutate(Source = "test") %>% filter(Evaluation == "Accept")
+
+# merge two dataframes 
+combined_test_wrong <- bind_rows(df_test1, df_wrong1)
+
+# Create plots for numeric columns
+numeric_plots <- lapply(numeric_columns, function(col) plot_numeric_comparison(combined_test_wrong, col))
+
+# Create plots for categorical columns
+categorical_plots <- lapply(categorical_columns, 
+                            function(col) plot_categorical_comparison(combined_test_wrong, col))
+
+# Save numeric plots to PDF
+save_plots_to_pdf(numeric_plots, file_name = file.path(outdir, "test_val_numeric_plots.pdf"))
+
+# Save categorical plots to PDF
+save_plots_to_pdf(categorical_plots, file_name = file.path(outdir, "test_val_categorical_plots.pdf"))
+```
+
+
+
+
+Training: filter correct Accept (based on OOB)
+Training: filter Accept but predicted Reject (based on OOB)
+Testing: filter Accept but predicted Reject
+Validation: filter Accept but predicted Reject
+
+Compare the distribution of their features
+
+```{r filter false negative peptides}
+# OOB correct Accepts
+train_correct_accept <- train_votes_file %>% 
+  filter(`rf_downsample$predicted` == "Accept" & Evaluation == "Accept") %>% 
+  select(-c(`rf_downsample$predicted`, Reject, Accept)) %>% 
+  mutate(Source = "oob_correct")
+# OOB wrong Reject
+train_wrong_reject <- train_votes_file %>% 
+  filter(`rf_downsample$predicted` == "Reject" & Evaluation == "Accept") %>% 
+  select(-c(`rf_downsample$predicted`, Reject, Accept)) %>%
+  mutate(Source = "oob_wrong")
+# test set wrong Reject
+test_wrong_reject <- df_test %>% 
+  mutate(predictions = rf_pred_downsample) %>% 
+  filter(predictions == "Reject" & Evaluation == "Accept") %>% 
+  select(-predictions) %>% 
+  mutate(Source = "test_wrong") 
+# validation set wrong Reject
+val_wrong_reject <- df_val1 %>% 
+  filter(Evaluation_pred == "Reject" & Evaluation == "Accept") %>% 
+  select(-c(Evaluation_pred, Reject_pred_prob, Accept_pred_prob)) %>%
+  mutate(Source = "validation_wrong")
+
+# join all dataframes
+combined_fn <- bind_rows(train_correct_accept, train_wrong_reject, test_wrong_reject, val_wrong_reject) %>% 
+  mutate(Source = factor(Source, levels = c("oob_correct", "oob_wrong", "test_wrong", "validation_wrong")))
+```
+
+
+```{r plot false negative peptides features}
+# Create plots for numeric columns
+numeric_plots_fn <- lapply(numeric_columns, function(col) plot_numeric_comparison(combined_fn, col))
+
+# Create plots for categorical columns
+categorical_plots_fn <- lapply(categorical_columns, 
+                            function(col) plot_categorical_comparison(combined_fn, col))
+
+# Save numeric plots to PDF
+save_plots_to_pdf(numeric_plots_fn, file_name = file.path(outdir, "numeric_plots_false_negative.pdf"))
+
+# Save categorical plots to PDF
+save_plots_to_pdf(categorical_plots_fn, file_name = file.path(outdir, "categorical_plots_false_negative.pdf"))
+```
+
+
+
+# False Positive peptides' features 
+
+We want to compare the features between the **correct Rejects**, and the **predicted Accepts** that are suppose to be Rejects. 
+
+In the validation set we don't have any of these peptides, so we are only looking at the OOB set and Test set. 
+
+In the training data for random forest, we filter rows that were actual Reject but predicted as Accept and compare their features to correct Accepts
+```{r filter false positive peptides}
+# OOB correct rejects
+train_correct_reject <- train_votes_file %>% 
+  filter(`rf_downsample$predicted` == "Reject" & Evaluation == "Reject") %>% 
+  select(-c(`rf_downsample$predicted`, Reject, Accept)) %>% 
+  mutate(Source = "oob_correct")
+# OOB wrong accepts
+train_wrong_accept <- train_votes_file %>% 
+  filter(`rf_downsample$predicted` == "Accept" & Evaluation == "Reject") %>% 
+  select(-c(`rf_downsample$predicted`, Reject, Accept)) %>%
+  mutate(Source = "oob_wrong")
+# test set wrong accepts
+test_wrong_accept <- df_test %>% 
+  mutate(predictions = rf_pred_downsample) %>% 
+  filter(predictions == "Accept" & Evaluation == "Reject") %>% 
+  select(-predictions) %>% 
+  mutate(Source = "test_wrong") 
+
+# join all dataframes
+combined_fp <- bind_rows(train_correct_reject, train_wrong_accept, test_wrong_accept) %>% 
+  mutate(Source = factor(Source, levels = c("oob_correct", "oob_wrong", "test_wrong")))
+```
+
+```{r plot fause positive peptides features}
+# Create plots for numeric columns
+numeric_plots_fp <- lapply(numeric_columns, function(col) plot_numeric_comparison(combined_fp, col))
+
+# Create plots for categorical columns
+categorical_plots_fp <- lapply(categorical_columns, 
+                            function(col) plot_categorical_comparison(combined_fp, col))
+
+# Save numeric plots to PDF
+save_plots_to_pdf(numeric_plots_fp, file_name = file.path(outdir, "numeric_plots_false_positive.pdf"))
+
+# Save categorical plots to PDF
+save_plots_to_pdf(categorical_plots_fp, file_name = file.path(outdir, "categorical_plots_false_positive.pdf"))
+```
+

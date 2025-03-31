@@ -1,0 +1,527 @@
+---
+title: "ML model"
+author: "Jennie Yao"
+date: "2023-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+library(ggplot2)
+library(glmnet)
+library(caret)
+library(pROC)
+library(randomForest)
+library(mice) # pmm imputation
+library(openxlsx) # save excel file
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "06_ml_training.Rmd")
+fs::dir_create(outdir)
+```
+
+
+Run this after  `05_cleaning_imputation.Rmd`
+
+Goal:  
+
+- Split data into training and testing set  
+- Train, validate, test different models  
+- Compare their AUC values
+
+Summary data (before imputation that has NAs):  
+
+* 21 patients  
+* 1050 peptides  
+* 73 predictors
+
+After imputation  
+
+* 21 patients  
+* 1324 peptides  
+* 73 predictors
+
+Read imputated data
+```{r}
+df_ml <- readRDS(here("output", "05_cleaning_imputation.Rmd", "df_imputed.rds"))
+dim(df_ml)
+df_ml %>% select(Evaluation) %>% summary()
+```
+
+
+
+
+
+
+# Split training and testing set
+
+For this analysis we are **excluding** samples with "Review"
+
+
+NOTE: variables in this script is scaled since it is required for logistic regression and Lasso. Scale numeric variables so they each have 0 mean 1 SD. 
+
+In script 07 the variables are NOT scaled since scaling is not necessary for random forest
+
+
+```{r}
+# Removed "Review", change "Pending" to "Reject"
+# Set "Accept" = 1, "Reject" = 0
+df_ml_no_review <- df_ml %>% 
+  filter(Evaluation != "Review") %>% 
+  mutate(Evaluation = ifelse(Evaluation == "Accept", 1, 0)) %>%
+  mutate(Evaluation = factor(Evaluation, levels = 0:1, labels = c("Reject", "Accept"))) %>%
+  mutate(across(where(is.numeric), scale)) # Scale the numeric predictors so they each have 0 mean 1 sd
+```
+
+
+Training and testing data is split as 75% and 25%
+
+```{r split to training and testing}
+# Set seed for reproducibility
+set.seed(918)
+
+# Number of total rows in the dataset
+total_rows <- nrow(df_ml_no_review) 
+
+# Number of rows for training (75%) and testing (25%)
+train_rows <- round(0.75 * total_rows)  # 75% for training
+test_rows <- total_rows - train_rows  # 25% for testing
+
+# Randomly select the rows for training
+train_indices <- sample(1:total_rows, train_rows)
+
+# Create the training and testing datasets
+train_data <- df_ml_no_review[train_indices, ] %>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+test_data <- df_ml_no_review[-train_indices, ] %>% 
+  select(-c(ID, patient_id)) %>% 
+  na.omit()
+```
+
+
+```{r training and testing data summary}
+summary(train_data$Evaluation) # 78% is reject
+summary(test_data$Evaluation) # 73% is reject
+```
+
+**Thoughts**: might be class-imbalance problems, could potentially impute more "Accepts" in this data (or de-sample "Reject" class)?
+
+
+# Model fitting and testing
+
+## Logistic regression
+```{r logit train}
+logit_fit <- glm(Evaluation ~ ., data = train_data, family = binomial)
+
+#summary(logit_fit)
+```
+
+
+```{r logit test}
+logit_prob = predict(logit_fit, test_data, type="response")
+```
+
+
+```{r}
+# check dummy variable
+contrasts(train_data$Evaluation)
+```
+
+
+```{r logit conf matrix}
+# make a vector of "Reject"
+logit_pred <- rep("Reject", length(logit_prob))
+# Change "Reject" to "Accept" when probability > 0.5 
+logit_pred[logit_prob >.5] <- "Accept"
+# Confusion matrix of observed VS predicted
+actual_values <- test_data$Evaluation
+(conf_matrix <- table(actual_values, logit_pred))
+```
+```{r logit sens spec}
+# Sensitivity = given it is a case, prob of predicting a case
+logit_sensitivity <-
+  round(((conf_matrix[2,1]/(conf_matrix[2,2]+conf_matrix[2,1]))*100),2)
+# Specificity =  given it is a control, prob of preicting a control
+logit_specificity<-
+  round(((conf_matrix[1,2]/(conf_matrix[1,1]+conf_matrix[1,2]))*100), 2)
+
+#logit_sens_spec <- cbind(sensitivity = logit_sensitivity, specificity = logit_specificity) 
+#logit_sens_spec
+```
+
+
+```{r logit roc}
+logit_roc <- roc(test_data$Evaluation ~ logit_prob, plot = TRUE, print.auc = TRUE)
+
+logit_auc <- auc(logit_roc)
+```
+
+
+## Random forest
+
+Random forests provide an improvement over bagged trees by way of a small tweak that decorrelates the trees. As in bagging, we build a number of decision trees on bootstrapped training samples. But when building these decision trees, each time a split in a tree is considered, a random sample of *m* predictors is chosen as split candidates from the full set of *p* predictors.
+The split is allowed to use only one of those *m* predictors.
+
+In other words, in building a random forest, at each split in the tree, the algorithm is not even allowed to consider a majority of the available predictors. This may sound crazy, but it has a clever rationale. Suppose that there is one very strong predictor in the data set, along with a number of other moderately strong predictors. Then in the collection of bagged
+variable importance random forest trees, most or all of the trees will use this strong predictor in the top split. Consequently, all of the bagged trees will look quite similar to each other. Hence the predictions from the bagged trees will be highly correlated. Unfortunately, averaging many highly correlated quantities does not lead to as large of a reduction in variance as averaging many uncorrelated quantities. In particular, this means that bagging will not lead to a substantial reduction in variance over a single tree in this setting.
+
+Random forests overcome this problem by forcing each split to consider only a subset of the predictors, giving other less-important predictors a chance. We can think of this process as **decorrelating** the trees, thereby making the average of the resulting trees less variable and hence more reliable.
+
+The OOB error is used to estimate the performance of a Random Forest model without the need for a separate validation dataset. 
+Here's how the OOB error works in Random Forest:
+
+1. Bootstrapping (Random Sampling with Replacement): Random Forest builds multiple decision trees. To create each tree, it samples the training dataset with replacement (bootstrapping). This means that each decision tree is trained on a different subset of the data.
+2. Out-of-Bag Data: When data is sampled with replacement, some observations are not included in the training subset for a specific tree. These omitted data points are referred to as "out-of-bag" (OOB) data for that particular tree.
+3. Estimating Error: Each tree in the Random Forest is tested on the OOB data that were not used during its training. This provides an estimate of how well the tree generalizes to unseen data. The OOB error for a specific tree is calculated based on its performance on the OOB data.
+3. Aggregate OOB Errors: The OOB errors from all the individual trees in the Random Forest are aggregated or averaged to compute the overall OOB error for the entire Random Forest model.
+
+The `tuneRF()` function allows us to find the `mtry` (*m*) number that gives the least OOB error to use in the randomForrest training.
+
+```{r rf oob tune}
+set.seed(918)
+## Tuned random forest result
+tune = tuneRF(train_data[, 2 : ncol(train_data)], train_data[, 1], ntreeTry = 500)
+# extract best mtry value that gives the lowest OOB error
+best_mtry <- tune %>% 
+  data.frame() %>%
+  filter(OOBError == min(OOBError)) %>%
+  pull(mtry)
+```
+
+
+```{r rf train}
+set.seed(918)
+rf = randomForest(Evaluation ~ ., data = train_data, ntree = 501, mtry = best_mtry, keep.forest = TRUE)
+# mtry is the number of predictors should be considered for each split of the tree
+# if mtry = total number of predictors, then it is bagging (trees are correlated)
+# if mtry < total number of predictors, then it is random forest (de-correlated the trees)
+```
+
+Could tune `mtry` and `ntree` for better performance
+
+```{r rf test}
+rf_pred = predict(rf, test_data)
+actual_values <- test_data$Evaluation
+conf_matrix <- table(actual_values, rf_pred)
+conf_matrix
+```
+
+
+```{r rf sens spec}
+# Sensitivity
+rf_sensitivity <-
+  (conf_matrix[2,2]/(conf_matrix[2,2]+conf_matrix[2,1]))*100
+# Specificity
+rf_specificity<-
+  (conf_matrix[1,1]/(conf_matrix[1,1]+conf_matrix[1,2]))*100
+
+#rf_sen_spe <- cbind(sensitivity = rf_sensitivity, specificity = rf_specificity) 
+#rf_sen_spe
+```
+
+```{r rf roc}
+# predict as probabilities instead of "Reject" and "Accept"
+tree_pred <- predict(rf, test_data, type="prob")
+tree_pred <- data.frame(tree_pred)
+
+rf_roc <- roc(test_data$Evaluation, tree_pred$Accept, plot = TRUE, print.auc = TRUE)
+rf_auc <- auc(rf_roc)
+```
+
+### Variable of importance
+
+The order of importance of variables is arranged using Gini index. Briefly, Gini importance measures the average gain of purity by splits of a given variable.
+The Gini index measures the "impurity" or "purity" of a node in a decision tree. In the context of variable importance, the Gini index can be used to estimate how much a variable contributes to the decision-making process within the Random Forest. A variable with a high Gini index is considered more important because it plays a significant role in reducing impurity (or increasing purity) at various nodes in the trees.
+
+
+```{r rf variable ordered by importance}
+# Variable importance plot
+varImpPlot(rf, sort = T, main = "Variable Importance (top 20)", n.var = 20, type = 2)
+
+# print the list of all predictors ordered by importance
+rf_importance <- rf$importance
+
+# Sort the features by their importance
+sorted_rf_importance <- rf_importance[order(-rf_importance[, 1]), , drop = FALSE]
+
+# Print the sorted feature importance
+#print("Feature Importance:")
+#print(sorted_rf_importance)
+```
+
+```{r rf tree VS error rate}
+plot(1 : 500, rf$err.rate[, 1],
+     col = "red",
+     type = "l",
+     xlab = "Number of Trees",
+     ylab = "Error Rate", ylim = c(0, 0.3))
+```
+
+Explored the out of bag misclassification error rate as a function of number of trees. We see that the error stabilizes after roughly 100 trees.
+
+
+### RF with down-sampling
+
+Since we have many more "Rejects" than "Accept", we are using down-sampling method in random forest such that we reduce the number of "Rejects" every time to match those of "Accept"
+
+```{r rf downsampling}
+tmp = as.vector(table(train_data$Evaluation))
+num_classes = length(tmp)
+min_size = tmp[order(tmp, decreasing=FALSE)[1]] 
+sampsizes = rep(min_size, num_classes)
+
+set.seed(918)
+rf_downsample = randomForest(Evaluation ~ ., data = train_data, importance = TRUE, ntree = 501, mtry = best_mtry, proximity = TRUE, sampsize = sampsizes, na.action = na.omit)
+```
+
+```{r rf downsampling test}
+rf_pred_downsample = predict(rf_downsample, test_data)
+rf_downsample_conf_matrix <- table(actual_values, rf_pred_downsample)
+rf_downsample_conf_matrix
+```
+
+```{r rf downsample sens spec}
+# Sensitivity
+rf_downsample_sensitivity <-
+  (rf_downsample_conf_matrix[2,2]/(rf_downsample_conf_matrix[2,2]+rf_downsample_conf_matrix[2,1]))*100
+# Specificity
+rf_downsample_specificity<-
+  (rf_downsample_conf_matrix[1,1]/(rf_downsample_conf_matrix[1,1]+rf_downsample_conf_matrix[1,2]))*100
+
+# predict as probabilities instead of "Reject" and "Accept"
+rf_pred_downsample_prob <- predict(rf_downsample, test_data, type="prob") %>% 
+  data.frame()
+#rf_pred_downsample <- data.frame(tree_pred)
+
+rf_downsample_roc <- roc(test_data$Evaluation, rf_pred_downsample_prob$Accept, plot = TRUE, print.auc = TRUE)
+rf_downsample_auc <- auc(rf_downsample_roc)
+```
+
+#### Prediction probabilities on test set
+
+```{r}
+rf_pred_downsample_prob <- predict(rf_downsample, test_data, type = "prob") %>% 
+  data.frame()
+# Reject prob
+rf_pred_downsample_prob %>% 
+  ggplot(aes(Reject)) + 
+  theme_minimal() + 
+  geom_histogram(fill = "cornflowerblue", color = "black") + 
+  geom_density(aes(y = ..density..), color = "lightgrey", size = 1) + # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Reject", 
+       title = "Test set: Probability distribution of test peptides classified as Reject", 
+       subtitle = "Probability of the same peptide classified as Accept is 1 minus the probability of it classified as \nReject")
+
+rf_pred_downsample_prob %>% 
+  ggplot(aes(Reject)) + 
+  theme_minimal() + 
+  geom_density( size = 1) + # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Reject", 
+       title = "Test set: Probability distribution of test peptides classified as Reject", 
+       subtitle = "Probability of the same peptide classified as Accept is 1 minus the probability of it classified as \nReject")
+
+# Accept prob
+rf_pred_downsample_prob %>% 
+  ggplot(aes(Accept)) + 
+  theme_minimal() + 
+  geom_histogram(fill = "cornflowerblue", color = "black") + 
+  geom_density(aes(y = ..density..), color = "lightgrey", size = 1) + # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Accept", 
+       title = "Test set: Probability distribution of test peptides classified as Accept")
+```
+
+#### OOB
+```{r}
+rf_downsample
+
+# Extract OOB error rates
+oob_error <- as.data.frame(rf_downsample$err.rate) # oob for each tree
+average_oob_downsample <- mean(oob_error$OOB) # same value as the OOB estimate of error rate in rf_downsample
+```
+
+
+
+#### Variable of importance
+
+Variable importance measures: 
+
+* `MeanDecreaseAccuracy` (MDA) measures how much the accuracy of the Random Forest model decreases when a particular predictor variable is randomly permuted while keeping other variables constant. The larger the decrease in accuracy, the more important the variable is considered. Higher MDA values suggest that a variable is more important in making accurate predictions. Conversely, lower MDA values suggest that a variable has less influence on the model's accuracy.
+* `MeanDecreaseGini` measures how much each predictor variable contributes to the overall reduction in Gini impurity when splitting the data at each node of the tree. Gini impurity is a measure of how often a randomly chosen element would be incorrectly classified.
+
+```{r}
+# Variable importance plot (with MeanDecreaseAccuracy score)
+varImpPlot(rf_downsample, sort = T, main = "Variable Importance down-sampled (top 20)", n.var = 20, type = 1)
+```
+
+
+```{r rf downsampling variable ordered by importance}
+# Variable importance plot (with MeanDecreaseGini score)
+varImpPlot(rf_downsample, sort = T, main = "Variable Importance down-sampled (top 20)", n.var = 20, type = 2)
+```
+
+
+
+```{r include=FALSE}
+# print the list of all predictors ordered by importance
+importances <- importance(rf_downsample)
+
+# Sort the importances in descending order and select the top N variables
+# Sorted by MeanDecreaseAccuracy
+importances[order(-importances[, 3]), ]
+```
+
+
+Variable importance 
+
+* `MeanDecreaseAccuracy` (MDA) measures how much the accuracy of the Random Forest model decreases when a particular predictor variable is randomly permuted while keeping other variables constant. The larger the decrease in accuracy, the more important the variable is considered. Higher MDA values suggest that a variable is more important in making accurate predictions. Conversely, lower MDA values suggest that a variable has less influence on the model's accuracy.
+* `MeanDecreaseGini` measures how much each predictor variable contributes to the overall reduction in Gini impurity when splitting the data at each node of the tree. Gini impurity is a measure of how often a randomly chosen element would be incorrectly classified.
+```{r}
+importance_scores <- importance(rf_downsample)
+```
+
+
+#### Predict on "Review" class
+
+For training and testing above, the dataset did not include peptides under "Review". We can apply the model on these peptides to see that the predicted probabilities are, and see if they fall in a middle area between 1 (Accept) and 0 (Reject)
+
+```{r}
+df_review <- df_ml %>% 
+  filter(Evaluation == "Review") %>%
+  mutate(across(where(is.numeric), scale))
+```
+
+```{r}
+rf_pred_review = predict(rf_downsample, df_review)
+actual_values_review <- df_review$Evaluation
+rf_review_conf_matrix <- table(actual_values_review, rf_pred_review)
+rf_review_conf_matrix
+```
+```{r}
+rf_pred_review_prob <- predict(rf_downsample, df_review, type = "prob") %>% 
+  data.frame()
+rf_pred_review_prob %>% 
+  ggplot(aes(Reject)) + 
+  theme_minimal() + 
+  geom_histogram(fill = "cornflowerblue", color = "black") + 
+  geom_density(aes(y = ..density..), color = "lightgrey", size = 1) + # aes(y = ..density..) is used to ensure that the smooth line is scaled to match the histogram's y-axis
+  labs(x = "Probabilities of peptides classified as Reject", 
+       title = "Probability distribution of Review peptides classified as Reject", 
+       subtitle = "Probability of the same peptide classified as Accept is 1 minus the probability of it classified as \nReject")
+```
+
+
+## Lasso
+
+For subset predictor selection 
+
+Since we have 73 predictors, we can try to reduce the number of predictors
+
+Lasso requires to tune the parameter `\lambda` using cross-validation
+
+```{r lasso data prep}
+# lasso
+set.seed(918)
+x = model.matrix(Evaluation ~ ., data = train_data)[,-1]
+y = train_data$Evaluation
+x_test = model.matrix(Evaluation ~ ., data = test_data)[,-1]
+y_test = test_data$Evaluation
+```
+
+Perform cross-validation and compute the associated test error.
+```{r lasso train}
+# Perform cross-validated Lasso logistic regression
+# default to let the function choose its own sequence of lamda values to test
+lasso_model <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+lasso_model
+plot(lasso_model)
+```
+Optimal Lambda (`lambda.min` and `lambda.1se`) from `lasso_model`: Two lambda values, lambda.min and lambda.1se, are often of interest. lambda.min corresponds to the lambda value that minimizes the cross-validated deviance, providing the "best" model in terms of predictive performance. lambda.1se is the largest lambda value within one standard error of the minimum and typically leads to a more parsimonious model.
+
+Binomial Deviance measure of the goodness-of-fit in binary classification problems, particularly when assessing the performance of logistic regression models.It quantifies the discrepancy between the predicted probabilities of an event (e.g., class "1" or "success") and the actual binary outcomes (e.g., "0" or "1").
+
+```{r lasso predict}
+# Use the optimal lambda to make predictions
+lasso_predictions <- predict(lasso_model, s = lasso_model$lambda.min, newx = x_test, type = "response")
+```
+
+Sensitivity and Specificity
+```{r lasso conf_matrix}
+# set threshold as 0.5 --> if a case has probability above 0.5 then it is "Accept"
+
+# make a vector of "Reject"
+lasso_pred <- rep("Reject", length(lasso_predictions))
+# Change "Reject" to "Accept" when probability > 0.5 
+lasso_pred[lasso_predictions >.5] <- "Accept"
+conf_matrix <- table(actual_values, lasso_pred)
+conf_matrix 
+# Sensitivity
+lasso_sensitivity <-
+  (conf_matrix[2,1]/(conf_matrix[2,2]+conf_matrix[2,1]))*100
+# Specificity
+lasso_specificity<-
+  (conf_matrix[1,2]/(conf_matrix[1,1]+conf_matrix[1,2]))*100
+
+#lasso_sen_spe <- cbind(sensitivity = lasso_sensitivity, specificity = lasso_specificity) 
+#lasso_sen_spe
+```
+
+
+```{r lasso roc auc}
+# Calculate ROC and AUC
+lasso_roc <- roc(y_test, lasso_predictions, plot = TRUE, print.auc = TRUE)
+lasso_auc <- lasso_roc$auc
+```
+
+The type = "response" argument specifies the type of prediction that the predict() function should produce. In the context of binary classification models like logistic regression (which is what Lasso logistic regression is), there are typically two types of predictions:
+
+Class Predictions (type = "response"): When you set type = "response", the predict() function will return the predicted probabilities of the positive class (e.g., "1" or "yes"). In binary classification, this means it provides the probability that each observation belongs to the positive class. You can use these probabilities to determine class predictions by applying a threshold (e.g., 0.5). If the predicted probability is greater than the threshold, it's classified as the positive class; otherwise, it's classified as the negative class.
+
+Class Labels (type = "class"): Alternatively, you can set type = "class", which will return the actual class labels (e.g., "0" or "1"). This is equivalent to applying a threshold of 0.5 to the predicted probabilities. Observations with predicted probabilities greater than or equal to 0.5 are assigned the positive class label ("1"), and those with predicted probabilities less than 0.5 are assigned the negative class label ("0").
+
+Using type = "response" is often useful when you want to calculate metrics like the Area Under the ROC Curve (AUC) or when you want to make predictions based on different threshold values (e.g., for varying the trade-off between precision and recall). It provides the raw probabilities, which can be thresholded as needed for classification.
+
+
+Variables of importance
+```{r eval=FALSE, include=FALSE}
+lasso_coef <- coef(lasso_model)
+non_zero_coefficients <- lasso_coef[s1 != .]
+```
+
+
+
+# Cross-validation
+
+To estimate the **test error rate** by holding out a subset of the training observations from the fitting process, and then applying the statistical learning method to those held out observations.
+
+It involves randomly dividing the available set of observations into two parts, a *training set* and a *validation set* or *hold-out set*. The model is fit on the training set, and the fitted model is used to predict the responses for the observations in the validation set. The resulting validation set error rate—typically assessed using **MSE** in the case of a quantitative response—provides an estimate of the test error rate.
+
+
+# Summary
+```{r echo=FALSE}
+Models <- c("Logistic", "Random Forest", "Random Forest downsampling", "Lasso")
+Sensitivity <- c(logit_sensitivity, rf_sensitivity, rf_downsample_sensitivity, lasso_sensitivity)
+Specificity <- c(logit_specificity, rf_specificity, rf_downsample_specificity, lasso_specificity)
+AUC <- c(logit_auc, rf_auc, rf_downsample_auc, lasso_auc)
+results <- data.frame(Models, Sensitivity, Specificity, AUC)
+knitr::kable(results)
+```
+
+# Other things to try
+
+ * Scale the predictors: help with convergence, coefficients more interpretable
+ * Calculate MSE to compare fit across different models (did this for 06 and 07 scripts)
+ * Test another set of models with three categories: Accept, Reject, Reivew
+ 
+ 
+ * Impute values
+ * random forest downsampling
+ * 3 way comparison 
+ * Try a model with only the most important set of predictors? 

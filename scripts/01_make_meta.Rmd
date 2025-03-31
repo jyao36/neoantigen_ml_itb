@@ -1,0 +1,222 @@
+---
+title: "Make metadata"
+author: "Jennie Yao"
+date: "2023-09-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+```
+
+**NOTE: THIS SCRIPT NO LONGER WORKS, FILE FORMATS HAVE BEEN CHANGED. TO ADD NEW SAMPLES, MANUALLY ADD THEM TO `/Neoantigen ML project/data/meta_manual.csv`**
+
+
+
+Output directory
+
+```{r set output directory}
+outdir <- here("output", "01_make_meta.Rmd")
+fs::dir_create(outdir)
+```
+
+
+
+
+# Meta data requirements
+
+Mata data for each patient (make each row as one patient) 
+Columns to include:  
+
+* patient id -- use id that match the Immuno Pipeline and design tracking sheet (need some clean up)
+* Cancer type of the patient (get from Immuno Pipeline and design tracking sheet)
+* Known gene of that cancer (from CancerGeneCensus-Mar2023.tsv) -- manual enter
+* Purity estimate (?? need directions on how to get this)  
+  - biopsy from tumor is mixed of normal and cancer cells
+  - how much of the biopsy sample is tumor cells
+  - purity = VAF of driver gene * 2
+  - need a list of driver gene for cancer type
+  - if patient has KRAS mutation, has pancrease cancer, we take the patient's KRAS VAF *2
+* patient's ITB file path  
+* patient's all_epitopes path  
+* patient's class 2 path  
+* whether this patient was included in the training data/testing data (?? patient peptides will be combined and then make training and testing set)  -- divide based on patients 
+* total number of peptides of the given patient (number of rows in the ITB review file)  
+* number of "Pass" peptides in the given patient (count from "Tier" column in the ITB review file)  
+* number of "Accept" peptides in the given patient (get from "Evaluation" column in the ITB review file)  
+* basic stats
+
+
+Other files
+itb_review:
+smb://storage1.ris.wustl.edu/gillandersw/Active/Project_0001_Clinical_Trials/CTEP/analysis/TWJF-10146-MO011-0021/itb-review-files/10146-0021.Annotated.Neoantigen_Candidates.tsv
+all_epitopes:
+smb://storage1.ris.wustl.edu/gillandersw/Active/Project_0001_Clinical_Trials/CTEP/analysis/TWJF-10146-MO011-0021/gcp_immuno/final_results/pVACseq/mhc_i/TWJF-10146-0021-Tumor_Lysate.all_epitopes.tsv
+class2:
+/Volumes/gillandersw/Active/Project_0001_Clinical_Trials/CTEP/analysis/TWJF-10146-MO011-0021/gcp_immuno/final_results/pVACseq/mhc_ii/TWJF-10146-0021-Tumor_Lysate.all_epitopes.aggregated.tsv
+
+pvacseq-v4 updated pipeline - latest rc
+all_epitopes: 
+/Volumes/gillandersw/Active/Project_0001_Clinical_Trials/pancreas_leidos/analysis/TWJF-5120-07_BGA-2109/pvacseq-v4/result-median-score-rc11/MHC_Class_I/TWJF-5120-07-5120-07_tumor_lysate.all_epitopes.tsv
+class2:
+/Volumes/gillandersw/Active/Project_0001_Clinical_Trials/pancreas_leidos/analysis/TWJF-5120-07_BGA-2109/pvacseq-v4/result-median-score-rc11/MHC_Class_II/TWJF-5120-07-5120-07_tumor_lysate.all_epitopes.aggregated.tsv
+
+
+## Modify from an existing patient file 
+
+Read reference metadata file (may change, this file has all the patient ID for this study)
+```{r read ref meta, message=FALSE}
+ref_meta <- read_xlsx(here("data", "Immuno Pipeline and Design Tracking.xlsx"))
+
+# Remove the first rows of comments
+ref_meta1 <- ref_meta[-1, ]
+
+# Make the row now as column names
+colnames(ref_meta1) <- ref_meta1[1, ]
+
+# Remove this row (which is now the column names)
+meta1 <- ref_meta1[-1, ]
+```
+
+Clean the dataframe, make a extra column that is the `patient ID`
+```{r meta extra columns}
+meta2 <- meta1 %>% 
+  mutate(`N (drive link)` = as.integer(`N (drive link)`)) %>%
+  mutate(patient_id = ifelse(
+      startsWith(`Case (Box link)`, "JLF"),
+      gsub(".*\\((.*?)\\).*", "\\1", `Case (Box link)`),
+      `Case (Box link)`
+    )) %>%
+  mutate(patient_id = ifelse(startsWith(patient_id, "5120"), 
+                           gsub("_", "-", patient_id), 
+                           patient_id))
+```
+
+
+## Add peptide count, pass count, and accept count columns to the metadata
+
+Write a function to add a column in the metadata file that counts the number of peptides for each patient, number of passing peptides, numbe of accepted peptides
+
+the above information will be pulled from the itb_review folder containing all ITB review files for each patient
+```{r get patient itb files}
+# list all available patient ITB files in the folder
+patient_itb_path <- list.files(here("data", "itb_review"),  full.names = TRUE) 
+# extract a list of patient id from file name (NOTE: not all patients in metadata file are in the folder)
+patient_id_itb <- patient_itb_path %>% 
+  basename() %>% 
+  gsub(".revd.Annotated.Neoantigen_Candidates.tsv$", "", .)
+```
+
+Define function
+
+* input: a patient's itb file path; metadata that we want to modify
+* output: a dataframe with the number of peptides, the number of pass, number of accept for a given patient's file
+
+```{r function for adding peptide counts, eval=FALSE, include=FALSE}
+extract_num_peptides <- function(patient_itb_path){
+  # extract patient id from itb file path
+  patient_id_itb <- patient_itb_path %>% 
+    basename() %>% 
+    gsub(".revd.Annotated.Neoantigen_Candidates.tsv$", "", .)
+  
+  # read the patient's itb file
+  itb_data <- read.table(patient_itb_path, header = TRUE, sep = "\t")
+  
+  n_peptides <- nrow(itb_data)
+  n_pass <- sum(itb_data$Tier == "Pass")
+  n_accept <- sum(itb_data$Evaluation == "Accept")
+  
+  # patient ID in metadata are in the form 5120_06, but in file names it is 5120-06
+  #patient_id_itb <- ifelse(startsWith(patient_id_itb, "5120"), 
+                           #gsub("-", "_", patient_id_itb), 
+                           #patient_id_itb)
+  
+  data.frame(patient_id = patient_id_itb, n_peptides, n_pass, n_accept)
+  
+}
+```
+
+```{r add peptide counts columns to meta, eval=FALSE, include=FALSE}
+# Use lapply to process each file and store the results in a list
+itb_patient_list <- lapply(patient_itb_path, extract_num_peptides)
+
+# Merge the list of data frames into a single dataframe
+itb_peptide_counts <- do.call(rbind, itb_patient_list)
+
+# join columns of counts to the metadata
+meta3 <- left_join(meta2, itb_peptide_counts, by = "patient_id")
+```
+
+
+## Add file paths
+
+```{r get all file paths}
+# list all available patient ITB files in the folder
+patient_itb_path <- list.files(here("data", "itb_review"),  full.names = TRUE) 
+# list patients that have available itb_review files
+patient_id_itb <- patient_itb_path %>% 
+  basename() %>% 
+  gsub(".revd.Annotated.Neoantigen_Candidates.tsv$", "", .) %>% 
+  gsub(".Annotated.Neoantigen_Candidates.tsv$", "", .)
+
+# list all available patient all_epitopes files in the folder
+patient_epi_path <- list.files(here("data", "all_epitopes"),  full.names = TRUE) 
+
+# list paths to all class 2 files
+patient_c2_path <- list.files(here("data", "class2"),  full.names = TRUE) 
+```
+
+Define a function that out all file paths to a dataframe
+input: patient_id, project directory where there is a sub-folder called "data" that contains three sub-folders named "itb_review", "all_epitopes", "class2"
+output: a dataframe with the file paths of the patient's file paths (3 columns for 3 file types)
+```{r function for get file paths}
+get_file_paths <- function(patient_id, project_dir){
+  # NOTE: the patient_id as input is the format in the file names, not in metadata
+  
+  # construct the directory paths for each file type
+  itb_path <- file.path(project_dir, "data", "itb_review")
+  epi_path <- file.path(project_dir, "data", "all_epitopes")
+  c2_path <- file.path(project_dir, "data", "class2")
+  
+  # get the file from the patient_id
+  itb_file_path <- list.files(itb_path, full.names = TRUE) %>% 
+    grep(patient_id, ., value = TRUE)
+  epi_file_path <- list.files(epi_path, full.names = TRUE) %>% 
+    grep(patient_id, ., value = TRUE)
+  c2_file_path <- list.files(c2_path, full.names = TRUE) %>% 
+    grep(patient_id, ., value = TRUE)
+  
+  # return a dataframe with patient_id, and file paths
+  data.frame(patient_id, 
+             itb_review_path = itb_file_path, 
+             all_epitopes_path = epi_file_path, 
+             class2_path = c2_file_path)
+}
+
+# test 
+get_file_paths("5120-06", here())
+```
+
+```{r add file paths columns to meta}
+# Use lapply to process each file and store the results in a list
+file_paths_df <- lapply(patient_id_itb, get_file_paths, here()) %>% 
+  do.call(rbind, .)
+
+# join columns of counts to the metadata
+meta4 <- left_join(meta2, file_paths_df, by = "patient_id")
+meta4
+```
+
+## Save final data
+
+```{r eval=FALSE, include=FALSE}
+write.csv(meta4, file=here(outdir, "metadata.csv"), row.names = FALSE)
+```
+
+
+
+`metadata.csv` is reviewed manually to modify patient_id, driver genes

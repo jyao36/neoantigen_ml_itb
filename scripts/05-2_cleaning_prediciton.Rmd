@@ -1,0 +1,180 @@
+---
+title: "Cleaning for prediction"
+author: "Jennie Yao"
+date: "2023-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+library(randomForest)
+library(openxlsx) # save excel file
+library(parallel)
+library(missForest) # random forest missing value imputation
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "05-2_cleaning_prediction.Rmd")
+fs::dir_create(outdir)
+```
+
+**NOTE: This file is for external validation/prediciton samples only! Not used during training (for training use script 05_cleaning_imputation.Rmd)**
+
+Run this after `04_reduce_columns_for_training.Rmd`
+
+Goal: 
+* uniform the column names as done in `05_cleaning_imputation.Rmd` 
+* save each patient data separately for prediction
+
+
+OUTCOME: 
+Output file: `patient_id_cleaned.RDS`
+
+
+
+Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that we will make predictions 
+```{r extract patient list}
+patient_id_list <- meta %>% 
+  filter(external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+```
+
+
+```{r}
+col_names_keep1 <- readRDS(file = file.path(here("output", "05_cleaning_imputation.Rmd"), "col_names_keep1.RDS"))
+col_names_keep2 <- readRDS(file = file.path(here("output", "05_cleaning_imputation.Rmd"), "col_names_keep2.RDS"))
+levels_list <- readRDS(file = file.path(here("output", "05_cleaning_imputation.Rmd"), "levels_list.RDS"))
+
+# Function to process each file and extract ID
+unify_columns <- function(patient_id_test, in_dir, out_dir) {
+  # read files through patient id
+  reduced_file_path <-
+    list.files(in_dir, 
+               pattern = paste0("^.*", patient_id_test, ".*\\.RDS$"), 
+               full.names = TRUE) 
+  reduced_data <- readRDS(reduced_file_path) %>% 
+    mutate(patient_id = patient_id_test)
+  
+  # modify column names
+  if (!any(colnames(reduced_data) %in% col_names_keep1)) {
+    reduced_data <- reduced_data %>%
+      rename(
+        "NetMHCpanEL.WT.IC50.Score" = "NetMHCpanEL.WT.Score",
+        "NetMHCpanEL.MT.IC50.Score" = "NetMHCpanEL.MT.Score",
+      )
+  }
+  
+  if (!any(colnames(reduced_data) %in% col_names_keep2)) {
+    reduced_data <- reduced_data %>%
+      rename(
+        "MHCflurry.WT.IC50.Score" = "MHCflurry.WT.Score",
+        "MHCflurry.MT.IC50.Score" = "MHCflurry.MT.Score",
+        "MHCnuggetsI.WT.IC50.Score" = "MHCnuggetsI.WT.Score",
+        "MHCnuggetsI.MT.IC50.Score" = "MHCnuggetsI.MT.Score",
+        "NetMHC.WT.IC50.Score" = "NetMHC.WT.Score", 
+        "NetMHC.MT.IC50.Score" = "NetMHC.MT.Score",
+        "NetMHCcons.WT.IC50.Score" = "NetMHCcons.WT.Score", 
+        "NetMHCcons.MT.IC50.Score" = "NetMHCcons.MT.Score", 
+        "NetMHCpan.WT.IC50.Score" = "NetMHCpan.WT.Score", 
+        "NetMHCpan.MT.IC50.Score" = "NetMHCpan.MT.Score", 
+         
+        "PickPocket.WT.IC50.Score" = "PickPocket.WT.Score", 
+        "PickPocket.MT.IC50.Score" = "PickPocket.MT.Score", 
+        "SMM.WT.IC50.Score" = "SMM.WT.Score", 
+        "SMM.MT.IC50.Score" = "SMM.MT.Score",
+        "SMMPMBEC.WT.IC50.Score" = "SMMPMBEC.WT.Score", 
+        "SMMPMBEC.MT.IC50.Score" = "SMMPMBEC.MT.Score"
+      )
+  }
+  
+  # change chr columns to factor levels
+  reduced_data2 <- reduced_data %>% 
+    #select(-Percentile.Fail) %>% 
+    mutate(
+        Prob.match = factor(Prob.match, levels = 0:1, labels = c("NO", "YES")),
+        Ref.Match = factor(Ref.Match, levels = 0:1, labels = c("FALSE", "TRUE")),
+        TSL = as.factor(TSL),
+        TSL = factor(TSL, levels = levels_list$TSL),
+        driver_gene = factor(driver_gene, levels = 0:1, labels = c("NO", "YES")),
+        #Evaluation = factor(Evaluation, levels = unique(Evaluation)), 
+        Biotype = factor(Biotype),
+        Biotype = factor(Biotype, levels = levels_list$Biotype),
+        Variant.Type = factor(Variant.Type),
+        Variant.Type = factor(Variant.Type, levels = levels_list$Variant.Type)
+      )
+  
+  # impute some missing values 
+  reduced_data_final <- reduced_data2 %>%
+  mutate(
+    NetMHC.WT.IC50.Score = if_else(is.na(NetMHC.WT.IC50.Score), IC50.WT.class1, NetMHC.WT.IC50.Score),
+    SMM.WT.IC50.Score = if_else(is.na(SMM.WT.IC50.Score), IC50.WT.class1, SMM.WT.IC50.Score),
+    SMMPMBEC.WT.IC50.Score = if_else(is.na(SMMPMBEC.WT.IC50.Score), IC50.WT.class1, SMMPMBEC.WT.IC50.Score),
+    NetMHC.MT.IC50.Score = if_else(is.na(NetMHC.MT.IC50.Score), IC50.MT.class1, NetMHC.MT.IC50.Score),
+    SMM.MT.IC50.Score = if_else(is.na(SMM.MT.IC50.Score), IC50.MT.class1, SMM.MT.IC50.Score),
+    SMMPMBEC.MT.IC50.Score = if_else(is.na(SMMPMBEC.MT.IC50.Score), IC50.MT.class1, SMMPMBEC.MT.IC50.Score),
+    NetMHC.WT.Percentile = if_else(is.na(NetMHC.WT.Percentile), percentile.WT.class1, NetMHC.WT.Percentile),
+    SMM.WT.Percentile = if_else(is.na(SMM.WT.Percentile), percentile.WT.class1, SMM.WT.Percentile),
+    SMMPMBEC.WT.Percentile = if_else(is.na(SMMPMBEC.WT.Percentile), percentile.WT.class1, SMMPMBEC.WT.Percentile),
+    NetMHC.MT.Percentile = if_else(is.na(NetMHC.MT.Percentile), percentile.MT.class1, NetMHC.MT.Percentile),
+    SMM.MT.Percentile = if_else(is.na(SMM.MT.Percentile), percentile.MT.class1, SMM.MT.Percentile),
+    SMMPMBEC.MT.Percentile = if_else(is.na(SMMPMBEC.MT.Percentile), percentile.MT.class1, SMMPMBEC.MT.Percentile)
+  )
+  
+  # Apply missForest to impute missing values in training set
+  # Exclude, ID, patient_id, and Evaluation columns during imputation
+  set.seed(918)
+  imputed_df <- missForest(reduced_data_final[, 4:ncol(reduced_data_final)-1])
+  
+  # Extract the imputed dataset
+  imputed_df2 <- imputed_df$ximp
+  
+  # paste the ID, patient_id back to the imputed value
+  columns_to_join <- c("ID", "patient_id", "Evaluation")
+  df_final <- bind_cols(reduced_data_final[columns_to_join], imputed_df2)
+  
+  
+  # save cleaned and imputed data
+  out_name_rds <- paste0(patient_id_test, "_", "cleaned.RDS")
+  saveRDS(df_final, file = file.path(out_dir, out_name_rds))
+  
+  # write a excel version
+  out_name_xl <- paste0(patient_id_test, "_", "cleaned.xlsx")
+  write.xlsx(df_final, file.path(outdir, out_name_xl), rowNames = FALSE)
+
+  
+  df_final
+}
+```
+
+```{r}
+# Apply the function to each file and combine the results into a list of dataframes
+#df_list <- lapply(
+  #patient_id_list,
+  #unify_columns,
+  #in_dir = file.path(here(), "output", "04_reduce_columns_for_training.Rmd"),
+  #out_dir = outdir
+#)
+
+df_list <- mclapply(
+  patient_id_list,
+  unify_columns,
+  in_dir = file.path(here(), "output", "04_reduce_columns_for_training.Rmd"),
+  out_dir = outdir,
+  mc.cores = 4
+)
+```
+
+
+

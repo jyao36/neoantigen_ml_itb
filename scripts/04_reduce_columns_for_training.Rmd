@@ -1,0 +1,245 @@
+---
+title: "Prepare files for training"
+author: "Jennie Yao"
+date: "2023-10-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(here)
+library(data.table)
+library(parallel)
+```
+
+UPDATE: This script can be used for both ML training and testing and external validation samples
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "04_reduce_columns_for_training.Rmd")
+fs::dir_create(outdir)
+```
+
+Run this after `03_merge_data.Rmd`
+
+Goal: 
+* After merging itb_review, class2 and all_epitopes file, there are many duplicate and redundant columns that are not useful for ML training and testing
+* Remove duplicate columns
+* Remove redundant columns
+* the output files should contain relevant columns suitable for training and testing
+
+New columns added: 
+* `Pos` for values with the form integer-integer (e.g. 2-10), only keep the first position
+* `Prob.Pos` is the position of mutation, changed to 0 if the value is "None", 1 otherwise
+    * Change “None” in the `Prob.Pos` column to 0.
+    * Create a new column `Prob.match` based on whether the integer(s) in `Prob.Pos` match the value in the `Pos` column.
+    * Modify the `Prob.Pos` column to keep only the first integer if there are multiple.
+* `Ref.Match` = factor(Ref.Match, levels = 0:1, labels = c("FALSE", "TRUE"))
+* `TSL = ifelse(is.na(TSL), 6, TSL)`, change NAs into 6 category
+* `Evaluation` changed to 1 if "Accept", 0 otherwise (also changed to a factor variable)
+* `driver_gene`: 1 if "Gene" is a driver gene (in the metadata), 0 otherwise
+
+
+OUTCOME:  
+Output file: `patient_id_reduced.tsv"` files in output directory.  
+
+
+
+# Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that will be used in the ML study & external prediction 
+```{r}
+patient_id_list <- meta %>% 
+  filter(include_ML == "Yes" | external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+```
+
+```{r for building the function reduce_columns, eval=FALSE, include=FALSE}
+# this chunk for building the function below
+patient_id_test <- "TWJF-5120-17"
+project_dir <- here()
+
+# Find the patient's file using grep
+matching_files <- list.files(file.path(project_dir, "output", "03_merge_data.Rmd"), 
+                              pattern = paste0("^.*", patient_id_test, ".*\\.tsv$"))
+  
+# read merged files through patient id
+merged_path <- file.path(project_dir, "output", "03_merge_data.Rmd")
+merged_full_file_path <- list.files(merged_path, full.names = TRUE) %>% 
+    grep(patient_id_test, ., value = TRUE)
+merged_data <- #read.table(merged_full_file_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  read.delim(merged_full_file_path, header = TRUE)
+# read.delim is exactly same as read.table(file, header = TRUE, sep = "\t", quote = "\"", dec = ".", fill = TRUE, comment.char = "")
+
+# Normalize the case of the Ref.Match column to ensure consistency
+# for unknown reasons the newer cases have "False/True" instead od "FALSE/TRUE" in the data EVENTHOUGH they look the same in Excel
+#merged_data$Ref.Match <- toupper(merged_data$Ref.Match)
+
+# extract driver genes for the patient from meta
+driver <- meta %>% 
+  filter(patient_id == patient_id_test) %>% 
+  select(driver_genes) %>% 
+  as.character()
+
+# Columns to keep
+all_columns <- colnames(merged_data)
+columns_keep <- c("ID", "Evaluation", "TSL", "Pos", "Prob.Pos", "Num.Passing.Peptides", "RNA.Expr", "RNA.VAF", "Allele.Expr", "RNA.Depth", "DNA.VAF", "Ref.Match", 
+                  "Biotype", "Variant.Type", "Peptide.Length", "Best.MT.IC50.Score", "Corresponding.WT.IC50.Score", "Corresponding.Fold.Change", "Best.MT.Percentile", "Corresponding.WT.Percentile", "Median.Fold.Change", "cysteine_count")
+
+new_data <- merged_data %>%
+    mutate(
+      Pos = as.numeric(gsub("^(\\d+).*", "\\1", Pos)), # keep the first integer as Pos since some values look like "0-10"
+      # Prob.Pos: first change None to 0
+      Prob.Pos = ifelse(Prob.Pos == "None", "0", Prob.Pos),
+      # Create a new column `Prob.match` based on whether the integer(s) in `Prob.Pos` match the value in the `Pos` column. 
+      Prob.match = ifelse(
+        mapply(function(pos, prob_pos) any(as.numeric(strsplit(prob_pos, ",")[[1]]) == pos), Pos, Prob.Pos),
+      1,
+      0), 
+      Prob.Pos = as.integer(sub(",.*", "", Prob.Pos)),
+      TSL = ifelse(is.na(TSL), 6, TSL), 
+      # Evaluation = ifelse(Evaluation == "Accept", 1, 0), 
+      #Ref.Match = ifelse(Ref.Match == "FALSE", 0, 1), 
+      Ref.Match = toupper(Ref.Match),
+      Ref.Match = factor(Ref.Match, levels = c("FALSE", "TRUE"), labels = c(0, 1)),
+      driver_gene = ifelse(Gene %in% unlist(strsplit(driver, ",")), 1, 0)
+    ) %>%
+    select(
+      columns_keep,
+      starts_with("IC50"),
+      starts_with("percentile"),
+      starts_with("MHCflurry"),
+      starts_with("MHCnuggetsI"),
+      starts_with("NetMHC"),
+      starts_with("PickPocket"),
+      starts_with("SMM"),
+      Prob.match,
+      driver_gene
+    )
+new_data
+```
+
+Define function
+```{r define reduce_columns function}
+reduce_columns <- function(patient_id_test, in_dir, out_dir){
+  # in_dir = merged data directory
+  # out_dir = where the reducted column files will be saved
+  
+  # Find the patient's file 
+  matching_files <-
+    list.files(
+      in_dir,
+      pattern = paste0("^.*", patient_id_test, ".*\\.tsv$")
+    )
+  
+  if (length(matching_files) == 0) {
+    cat("Patient ID", patient_id_test, "not found in the directory. Skipping...\n")
+    return(NULL)
+  } else{
+    cat("Patient ID", patient_id_test, "reducing files\n")
+  }
+  
+  # read merged files through patient id
+  merged_path <- in_dir
+  merged_full_file_path <-
+    list.files(merged_path, full.names = TRUE) %>%
+    grep(patient_id_test, ., value = TRUE)
+  merged_data <-
+    #read.table(merged_full_file_path, header = TRUE, sep = "\t")
+    read.delim(merged_full_file_path, header = TRUE)
+  
+  # extract driver genes for the patient from meta
+  driver <- meta %>%
+    filter(patient_id == patient_id_test) %>%
+    select(driver_genes) %>%
+    as.character()
+  
+  # Columns to keep
+  all_columns <- colnames(merged_data)
+  columns_keep <-
+    c(
+      "ID",
+      "Evaluation",
+      "TSL",
+      "Pos",
+      "Prob.Pos",
+      "Num.Passing.Peptides",
+      "RNA.Expr",
+      "RNA.VAF",
+      "Allele.Expr",
+      "RNA.Depth",
+      "DNA.VAF",
+      "Ref.Match",
+      "Biotype",
+      "Variant.Type",
+      "Peptide.Length",
+      "Best.MT.IC50.Score",
+      "Corresponding.WT.IC50.Score",
+      "Corresponding.Fold.Change",
+      "Best.MT.Percentile",
+      "Corresponding.WT.Percentile",
+      "Median.Fold.Change",
+      "cysteine_count"
+    )
+  new_data <- merged_data %>%
+    mutate(
+      Pos = as.numeric(gsub("^(\\d+).*", "\\1", Pos)), # keep the first integer as Pos since some values look like "0-10"
+      Pos = as.integer(Pos), 
+      # Prob.Pos: first change None to 0
+      Prob.Pos = ifelse(Prob.Pos == "None", "0", Prob.Pos),
+      # Create a new column `Prob.match` based on whether the integer(s) in `Prob.Pos` match the value in the `Pos` column. 
+      Prob.match = ifelse(
+        mapply(function(pos, prob_pos) any(as.numeric(strsplit(prob_pos, ",")[[1]]) == pos), Pos, Prob.Pos),
+      1,
+      0), 
+      Prob.Pos = as.integer(sub(",.*", "", Prob.Pos)),
+      TSL = ifelse(is.na(TSL), 6, TSL), 
+      Ref.Match = toupper(Ref.Match),
+      Ref.Match = factor(Ref.Match, levels = c("FALSE", "TRUE"), labels = c(0, 1)),
+      driver_gene = ifelse(Gene %in% unlist(strsplit(driver, ",")), 1, 0)
+    ) %>%
+    select(
+      columns_keep,
+      starts_with("IC50"),
+      starts_with("percentile"),
+      starts_with("MHCflurry"),
+      starts_with("MHCnuggetsI"),
+      starts_with("NetMHC"),
+      starts_with("PickPocket"),
+      starts_with("SMM"),
+      Prob.match,
+      driver_gene
+    ) # 72 columns from original df + Prob.match + driver_gene = 74 columns
+  
+  # generate file name
+  out_name <- paste0(patient_id_test, "_", "reduced.tsv")
+  out_name_rds <- paste0(patient_id_test, "_", "reduced.RDS")
+  
+  # save the output into the outdir
+  write.table(new_data, file = file.path(out_dir, out_name), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  # save RDS version
+  saveRDS(new_data, file = file.path(out_dir, out_name_rds))
+}
+```
+
+Test on one file
+```{r test function with one patient, eval=FALSE}
+test_data <- reduce_columns("5120-39",  
+                            in_dir = file.path(here(), "output", "03_merge_data.Rmd"), 
+                            outdir)
+```
+
+Run function on all patients
+```{r merge all patient data}
+#patient_id_list
+#lapply(patient_id_list, reduce_columns, in_dir = file.path(here(), "output", "03_merge_data.Rmd"), out_dir = outdir)
+mclapply(patient_id_list, reduce_columns, in_dir = file.path(here(), "output", "03_merge_data.Rmd"), out_dir = outdir, mc.cores = 4)
+```

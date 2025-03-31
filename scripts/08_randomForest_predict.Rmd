@@ -1,0 +1,510 @@
+---
+title: "Random Forest prediction"
+author: "Jennie Yao"
+date: "2023-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(here)
+library(ggplot2)
+library(pROC)
+library(randomForest)
+library(openxlsx)
+library(parallel)
+```
+
+Output directory
+```{r set output directory}
+outdir <- here("output", "08_randomForest_predict.Rmd")
+fs::dir_create(outdir)
+```
+
+**NOTE: This file is for external validation/prediciton samples only!**
+
+Goal: 
+* Predict on new incoming patient data using the Random Forest model trained in `07_ml_randomForest.Rmd`
+* Used the down-sampled model for prediction (predicted on two different thresholds)
+* bind the predictions (as the `Evaluation` column) to the original patient itb_review file
+* upload this file to PVACView 
+
+
+
+Read the trained model
+```{r read trained model}
+rf_downsample <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "rf_downsample.RDS"))
+```
+
+Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that we will make predictions 
+```{r extract patient list}
+patient_id_list <- meta %>% 
+  filter(external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+```
+
+
+# Prediction (Accept VS Reject model)
+
+Read new patient cleaned file from `05-2_cleaning_prediction.Rmd`
+
+```{r eval=FALSE, include=FALSE}
+# this chunk is for building the function below
+# read files through patient id
+patient_id <- patient_id_list[2]
+in_dir <- here("output", "05-2_cleaning_prediction.Rmd")
+cleaned_file_path <- in_dir
+cleaned_file_path <-
+    list.files(cleaned_file_path, full.names = TRUE) %>%
+    grep(paste0(patient_id, ".*\\.RDS$"), ., value = TRUE)
+
+cleaned_data <- readRDS(cleaned_file_path) #%>% 
+  #mutate(across(where(is.numeric), scale))
+
+#test_data <- readRDS(here("output", "05-2_cleaning_prediction.Rmd", "test_data.RDS")) %>% 
+  #select(-Evaluation)
+
+#union(setdiff(colnames(cleaned_data), colnames(test_data)), setdiff(colnames(test_data), colnames(cleaned_data)))
+
+# make prediction 
+rf_pred = predict(rf_downsample, cleaned_data %>% select(-c(ID, Evaluation)), type = "prob") %>% data.frame()
+
+final_pred <- cleaned_data %>%
+  cbind(., rf_pred) %>% 
+  rename(Reject_pred_prob = Reject, 
+         Accept_pred_prob = Accept) %>% 
+  mutate(Evaluation_pred = ifelse(
+    is.na(rf_pred$Accept),
+    "Pending",
+    ifelse(
+      rf_pred$Accept >= 0.60,
+      "Accept",
+      ifelse(
+        rf_pred$Accept > 0.40 &
+          rf_pred$Accept < 0.60,
+        "Review",
+        "Reject"
+      )
+    )
+  ))
+
+final_pred %>% select(c(Evaluation, Evaluation_pred))
+
+final_pred %>% select(c(Evaluation, Evaluation_pred)) %>% mutate_all(as.factor) %>% summary()
+
+# export this example to see how the predictions compare to the actual evaluation
+write.xlsx(final_pred, file = file.path(outdir, paste0(patient_id, "_", "predict_compare.xlsx")), rowNames = FALSE)
+
+# read the original itb_review file so we can now join the predicted Evaluation back to the itb_review file and upload it to PVACview
+# get files through patient id
+project_dir = here()
+itb_path <- file.path(project_dir, "data", "itb_review")
+itb_file_path <- list.files(itb_path, full.names = TRUE, 
+                              pattern = paste0("^.*", patient_id, ".*\\.tsv$")) #%>% 
+    #grep(patient_id, ., value = TRUE)
+itb_file <- read.table(itb_file_path, header = TRUE, sep = "\t", 
+                       check.names = FALSE)
+
+final_df <- itb_file %>% 
+  select(-Evaluation) %>% 
+  left_join(., final_pred %>% select(c(ID, Evaluation_pred)), by = "ID") %>% 
+  rename(Evaluation = Evaluation_pred) 
+
+final_df %>% 
+  mutate(Evaluation = factor(Evaluation)) %>% summary()
+
+out_name = paste0(patient_id, "_", "predict.tsv")
+write.table(final_df, file = file.path(outdir, out_name), sep = "\t", row.names = FALSE, col.names = TRUE)
+
+final_df2 <- itb_file %>% 
+  select(-Evaluation) %>% 
+  left_join(., final_pred %>% select(c(ID, Evaluation_pred, Reject_pred_prob, Accept_pred_prob)), by = "ID") #%>% 
+  #rename(Evaluation = Evaluation_pred) 
+
+```
+
+Threshold used for prediction categories: 
+Using the **predicted probability of a peptide being "Accept"**, use a threshold of 0.4 and 0.6 (arbitrary numbers based on distributions and inspection):
+* predicted prob <= 0.4 --> Reject
+* 0.4 < predicted prob < 0.6 --> Review
+* predicted prob >= 0.6 --> Accept
+* NA --> Pending
+
+Output: 
+  * patient_id_predict.tsv -- has predictions, in the same format to be uploaded to pvacView
+  * patient_id_predict2.tsv -- in addition to the predictions, it includes the predicted probabilities of a peptide being Accept/Reject
+
+```{r rf_predict_on_new function}
+rf_predict_on_new <-
+  function(patient_id, project_dir, in_dir, outdir) {
+    # read cleaned data that is used for prediction
+    cleaned_file_path <- in_dir
+    cleaned_file_path <-
+      list.files(cleaned_file_path, full.names = TRUE) %>%
+      grep(paste0(patient_id, ".*\\.RDS$"), ., value = TRUE)
+    
+    cleaned_data <- readRDS(cleaned_file_path) #%>%
+    #mutate(across(where(is.numeric), scale))
+    
+    # make prediction with rf_downsample model
+    rf_pred = predict(rf_downsample, cleaned_data %>% select(-c(ID, Evaluation)), type = "prob") %>% data.frame()
+    
+    # change predicted probabilities into "Accept", "Reject", "Review" based on set thresholds. Change NAs (FS non-imputed rows) to "Pending"
+    final_pred <- cleaned_data %>%
+      cbind(., rf_pred) %>%
+      rename(Reject_pred_prob = Reject, Accept_pred_prob = Accept) %>%
+      mutate(Evaluation_pred = ifelse(
+        is.na(rf_pred$Accept),
+        "Pending",
+        ifelse(
+          rf_pred$Accept >= 0.60,
+          "Accept",
+          ifelse(
+            rf_pred$Accept > 0.40 &
+              rf_pred$Accept < 0.60,
+            "Review",
+            "Reject"
+          )
+        )
+      ))
+    
+    # Now read the original itb_review file
+    itb_path <- file.path(project_dir, "data", "itb_review")
+    itb_file_path <- list.files(
+      itb_path,
+      full.names = TRUE,
+      pattern = paste0("^.*", patient_id, ".*\\.tsv$")
+    ) #%>%
+    #grep(patient_id, ., value = TRUE)
+    itb_file <- read.table(
+      itb_file_path,
+      header = TRUE,
+      sep = "\t",
+      check.names = FALSE
+    )
+    
+    # join the predicted Evaluation back to the original itb_review file
+    final_df <- itb_file %>%
+      select(-Evaluation) %>%
+      left_join(., final_pred %>% select(c(ID, Evaluation_pred, Accept_pred_prob)), by = "ID") %>%
+      rename(Evaluation = Evaluation_pred) %>%
+      mutate(Comments = paste("Probability of Accept:", round(Accept_pred_prob, 3))) %>% # add probability to Comments
+      select(-Accept_pred_prob)
+    
+    # export the itb_review file with new predictions
+    out_name = paste0(patient_id, "_", "predict.tsv")
+    write.table(
+      final_df,
+      file = file.path(outdir, out_name),
+      sep = "\t",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+    
+    # make another version that keeps the Reject and Accept predicted probabilities
+    final_df2 <- itb_file %>%
+      select(-Evaluation) %>%
+      left_join(., final_pred %>% select(c(
+        ID, Evaluation_pred, Reject_pred_prob, Accept_pred_prob
+      )), by = "ID") %>%
+      mutate(Comments = paste("Probability of Accept: ", round(Accept_pred_prob, 3))) # add probability to Comments 
+    
+    out_name2 = paste0(patient_id, "_", "predict2.tsv")
+    write.table(
+      final_df2,
+      file = file.path(outdir, out_name2),
+      sep = "\t",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+  }
+```
+
+Make predictions on all new samples
+```{r apply rf_predict_on_new to samples}
+#lapply(
+  #patient_id_list,
+  #rf_predict_on_new,
+  #project_dir = here(), 
+  #in_dir = here("output", "05-2_cleaning_prediction.Rmd"),
+  #outdir = outdir
+#)
+
+mclapply(
+  patient_id_list,
+  rf_predict_on_new,
+  project_dir = here(), 
+  in_dir = here("output", "05-2_cleaning_prediction.Rmd"),
+  outdir = outdir,
+  mc.cores = 4
+)
+```
+
+# New predictions with adjusted thresholds
+
+This new threshold is based on the analysis in 08-1_threshold_adj.Rmd. 
+
+The new threshold expands the "Review" pile to put more "Rejects" under review. The threshold for "Accepts" remain the same.
+
+NEW Threshold used for prediction categories: 
+Using the predicted probability of a peptide being "Accept", use a threshold of 0.2 and 0.6 (arbitrary numbers based on distributions and inspection):
+* predicted prob <= 0.2 --> Reject
+* 0.2 < predicted prob < 0.6 --> Review
+* predicted prob >= 0.6 --> Accept
+* NA --> Pending
+
+Output: 
+  * patient_id_predict_newThreshold.tsv -- has predictions, in the same format to be uploaded to pvacView
+  * patient_id_predict_newThreshold2.tsv -- in addition to the predictions, it includes the predicted probabilities of a peptide being Accept/Reject
+
+```{r rf_predict_on_new2 funciton}
+rf_predict_on_new2 <-
+  function(patient_id, project_dir, in_dir, outdir) {
+    # read cleaned data that is used for prediction
+    #cleaned_file_path <- in_dir
+    #cleaned_file_path <-
+    #list.files(cleaned_file_path, full.names = TRUE) %>%
+    #grep(paste0(patient_id, ".*\\.RDS$"), ., value = TRUE)
+    # Find the cleaned RDS file
+    cleaned_file_path <- list.files(in_dir, full.names = TRUE) %>%
+      grep(paste0(patient_id, ".*\\.RDS$"), ., value = TRUE)
+    
+    # Debug: Print the file path
+    print(paste("Checking file:", cleaned_file_path))
+    
+    # Check if the file exists
+    if (length(cleaned_file_path) == 0 ||
+        !file.exists(cleaned_file_path)) {
+      stop(paste("Error: File not found for patient", patient_id))
+    }
+    
+    # Check if cleaned_file_path is valid
+    if (!is.character(cleaned_file_path) ||
+        nchar(cleaned_file_path) == 0) {
+      stop("Invalid file path provided to readRDS()")
+    }
+    
+    # Attempt to read the file
+    cleaned_data <- readRDS(cleaned_file_path)
+
+    # make prediction with rf_downsample model
+    rf_pred = predict(rf_downsample, cleaned_data %>% select(-c(ID, Evaluation)), type = "prob") %>% data.frame()
+    
+    # change predicted probabilities into "Accept", "Reject", "Review" based on set thresholds. Change NAs (FS non-imputed rows) to "Pending"
+    final_pred <- cleaned_data %>%
+      cbind(., rf_pred) %>%
+      rename(Reject_pred_prob = Reject, Accept_pred_prob = Accept) %>%
+      mutate(Evaluation_pred = ifelse(
+        is.na(rf_pred$Accept),
+        "Pending",
+        ifelse(
+          rf_pred$Accept >= 0.60,
+          "Accept",
+          ifelse(
+            rf_pred$Accept > 0.20 &
+              rf_pred$Accept < 0.60,
+            "Review",
+            "Reject"
+          )
+        )
+      ))
+    
+    # Now read the original itb_review file
+    itb_path <- file.path(project_dir, "data", "itb_review")
+    itb_file_path <- list.files(
+      itb_path,
+      full.names = TRUE,
+      pattern = paste0("^.*", patient_id, ".*\\.tsv$")
+    ) #%>%
+    #grep(patient_id, ., value = TRUE)
+    itb_file <- read.table(
+      itb_file_path,
+      header = TRUE,
+      sep = "\t",
+      check.names = FALSE
+    )
+    
+    # join the predicted Evaluation back to the original itb_review file
+    final_df <- itb_file %>%
+      select(-Evaluation) %>%
+      left_join(., final_pred %>% select(c(ID, Evaluation_pred, Accept_pred_prob)), by = "ID") %>%
+      rename(Evaluation = Evaluation_pred) %>%
+      mutate(Comments = paste("Probability of Accept:", round(Accept_pred_prob, 3))) %>% # add probability to Comments
+      select(-Accept_pred_prob)
+    
+    # export the itb_review file with new predictions
+    out_name = paste0(patient_id, "_", "predict_newThreshold.tsv")
+    write.table(
+      final_df,
+      file = file.path(outdir, out_name),
+      sep = "\t",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+    
+    # make another version that keeps the Reject and Accept predicted probabilities
+    final_df2 <- itb_file %>%
+      select(-Evaluation) %>%
+      left_join(., final_pred %>% select(c(
+        ID, Evaluation_pred, Reject_pred_prob, Accept_pred_prob
+      )), by = "ID") %>%
+      mutate(Comments = paste("Probability of Accept:", round(Accept_pred_prob, 3))) # add probability to Comments
+    
+    out_name2 = paste0(patient_id, "_", "predict_newThreshold2.tsv")
+    write.table(
+      final_df2,
+      file = file.path(outdir, out_name2),
+      sep = "\t",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+  }
+```
+
+Make predictions on all new samples
+```{r apply rf_predict_on_new2 to samples}
+#rf_predict_on_new2("04143-004", project_dir = here(), in_dir = here("output", "05-2_cleaning_prediction.Rmd"), outdir = outdir)
+
+#lapply(
+  #patient_id_list,
+  #rf_predict_on_new2,
+  #project_dir = here(), 
+  #in_dir = here("output", "05-2_cleaning_prediction.Rmd"),
+  #outdir = outdir
+#)
+
+mclapply(
+  patient_id_list,
+  rf_predict_on_new2,
+  project_dir = here(), 
+  in_dir = here("output", "05-2_cleaning_prediction.Rmd"),
+  outdir = outdir,
+  mc.cores = 4
+)
+```
+
+# Prediction (One VS Rest model)
+
+Get model
+```{r}
+rf_models <- readRDS(file = here("output", "07_ml_randomForest.Rmd", "one_vs_rest_rfds.rds"))
+```
+
+For each test data point in test_data_all, make predictions using all three models. The class with the highest predicted probability becomes the final prediction.
+
+
+Funciton for making prediction for each patient using one-vs-rest model
+```{r}
+rf_predict_ovr <-
+  function(patient_id, project_dir, in_dir, outdir) {
+    # read cleaned data that is used for prediction
+    cleaned_file_path <- in_dir
+    cleaned_file_path <-
+      list.files(cleaned_file_path, full.names = TRUE) %>%
+      grep(paste0(patient_id, ".*\\.RDS$"), ., value = TRUE)
+    
+    cleaned_data <- readRDS(cleaned_file_path)
+    
+    ## Predictions
+    # make prediction with rf_downsample model for each class
+    class_labels <- c("Accept", "Reject", "Review")
+    num_pred_peptides <- nrow(cleaned_data)
+    predictions <- matrix(NA, nrow = num_pred_peptides, ncol = length(class_labels))
+    
+    for (i in 1:length(class_labels)) {
+      predicted_prob <- predict(rf_models[[i]], 
+                                newdata = cleaned_data %>% select(-c(ID, Evaluation)), 
+                                type = "prob")[, "1"]
+      # choose the predicted probabilities of "1"s in each model
+      
+      # Store the predicted probability in the matrix
+      predictions[, i] <- predicted_prob
+    }
+    
+    # Assign "Pending" for rows with NA, otherwise find the most likely class based on the highest probability
+    predicted_classes <- apply(predictions, 1, function(row) {
+      if (any(is.na(row))) {
+        return("Pending")  # Assign "Pending" if the row contains NA
+      } else {
+        return(class_labels[which.max(row)])  # Assign the class with the highest probability
+      }
+    })
+    
+    # Convert the result to a character vector
+    predicted_classes <- as.character(predicted_classes)
+    
+
+    ## Read ITB review file
+    # Now read the original itb_review file (with the real Evaluations)
+    itb_path <- file.path(project_dir, "data", "itb_review")
+    itb_file_path <- list.files(
+      itb_path,
+      full.names = TRUE,
+      pattern = paste0("^.*", patient_id, ".*\\.tsv$")
+    ) 
+    itb_file <- read.table(
+      itb_file_path,
+      header = TRUE,
+      sep = "\t",
+      check.names = FALSE
+    )
+    
+    ## Organize data for export
+    # Define class labels
+    class_label_colNames <- c("Accept_prob", "Reject_prob", "Review_prob")
+    
+    # Step 1: Add `predicted_classes` to `cleaned_data`
+    cleaned_data$Pred_oneVSrest <- predicted_classes
+    
+    # Step 2: Convert the `predictions` matrix to a data frame and name the columns
+    predictions_df <- as.data.frame(predictions)
+    colnames(predictions_df) <- class_label_colNames
+    
+    # Step 3: Add the predictions as new columns to `cleaned_data`
+    cleaned_data <- cbind(cleaned_data, predictions_df)
+    
+    # Step 4: Select only the required columns
+    selected_columns <- cleaned_data %>%
+      select(ID, Pred_oneVSrest, all_of(class_label_colNames))  # Ensure "ID" is in cleaned_data
+    
+    # Step 5: Perform a left join with `itb_file`
+    final_df <- left_join(itb_file,
+                            cleaned_data %>%
+                              select(ID, Pred_oneVSrest, all_of(class_label_colNames)),
+                            by = "ID")
+    
+    ## Export the itb_review file with new predictions
+    out_name = paste0(patient_id, "_", "predict_oneVSrest.tsv")
+    write.table(
+      final_df,
+      file = file.path(outdir, out_name),
+      sep = "\t",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+  }
+```
+
+
+```{r}
+#rf_predict_ovr("04143-004", project_dir = here(), in_dir = here("output", "05-2_cleaning_prediction.Rmd"), outdir = outdir)
+
+mclapply(
+  patient_id_list,
+  rf_predict_ovr,
+  project_dir = here(), 
+  in_dir = here("output", "05-2_cleaning_prediction.Rmd"),
+  outdir = outdir,
+  mc.cores = 4
+)
+```
+
