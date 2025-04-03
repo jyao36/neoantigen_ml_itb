@@ -480,6 +480,14 @@ plot(ntree_values_rfds, oob_errors_rfds, type = "b", xlab = "Number of Trees", y
 make sure model is fully deterministic, so use 5001 (if it is an even number then plus 1)
 
 ```{r rf downsampled training, eval=FALSE, include=FALSE}
+best_mtry_rfds <- readRDS(file = file.path(outdir, "best_mtry_rfds.RDS"))
+best_ntree_rfds <- readRDS(file = file.path(outdir, "best_ntree_rfds.RDS"))
+print(best_mtry_rfds)
+print(best_ntree_rfds)
+```
+
+
+```{r rf downsampled training, eval=FALSE, include=FALSE}
 set.seed(918)
 rfds = randomForest(Evaluation ~ ., data = train_data, 
                              importance = TRUE, ntree = best_ntree_rfds, mtry = best_mtry_rfds, 
