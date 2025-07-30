@@ -37,7 +37,9 @@ pred_dir <- here("output", "08-1_threshold_adj.Rmd") # random forest predictions
 manual_review_dir <- here("data", "files_for_prediction", "with_manual_review_comments") # the itb file after the manual review process
 ```
 
-Function to merge itb reviewed file, true Evaluation, and predicted Evaluations, probabilities, manual review comments, and final Evaluation decision together into one file for analysis
+Function to merge 
+itb reviewed file, 
+true Evaluation, and predicted Evaluations, probabilities, manual review comments, and final Evaluation decision together into one file for analysis
 
 ```{r}
 merge_pred_eval_comments <- function(patient_id, pred_dir, manual_review_dir, outdir) {

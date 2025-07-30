@@ -1,0 +1,4 @@
+trial,tumor_type,total_patients,total_peptides,count_accept,count_reject,count_review
+CTEP,Metastatic TNBC,4,164,50,114,37
+Leidos/NCI,Pancreas,7,238,68,170,47
+TOTAL,ALL,11,402,118,284,84

@@ -1,0 +1,3 @@
+Best max_features (mtry): 28
+Best n_estimators (ntree): 101
+Best parameters: {'max_features': 28, 'n_estimators': 101}

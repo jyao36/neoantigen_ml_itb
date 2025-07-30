@@ -8,17 +8,20 @@ from sklearn.preprocessing import LabelEncoder
 
 #%% Load the trained Random Forest model and metadata -----------------------------------------------------
 # Load the trained Random Forest model
-model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/07_ml_randomForest.ipynb/rf_model.pkl")
+#model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/model_artifacts/rf_model_final.pkl")
+model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/transform_training_data4python.ipynb/rf_model.pkl")
 rf_model = joblib.load(model_path)
 
 # Define directories
 project_dir = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project")
-in_dir = project_dir / "output" / "05-2_cleaning_prediction.Rmd"
+in_dir = project_dir / "output_python" / "05-2_cleaning_prediction.py"
 outdir = project_dir / "output_python" / "08_randomForest_predict.py"
 os.makedirs(outdir, exist_ok=True)
 
 # Read metadata
 meta = pd.read_csv(project_dir / "output_python" / "02_make_meta2.ipynb" / "metadata_count_purity.csv")
+# If running with R, use the following line instead:
+#meta = pd.read_csv(project_dir / "output" / "02_make_meta2.Rmd" / "metadata_count_purity.csv")
 
 # Get a list of patient IDs for external validation
 patient_id_list = meta.loc[meta["external_validation"] == "Yes", "patient_id"].tolist()
@@ -42,10 +45,10 @@ for col, classes in class_mappings.items():
 #%% Prediction (Accept VS Reject model) -------------------------------------------------------------------
 def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
     # Read cleaned data that is used for prediction
-    cleaned_file_path = list(in_dir.glob(f"*{patient_id}*.xlsx"))
+    cleaned_file_path = list(in_dir.glob(f"*{patient_id}*.csv"))
     if not cleaned_file_path:
         raise FileNotFoundError(f"No cleaned data file found for patient: {patient_id}")
-    cleaned_data = pd.read_excel(cleaned_file_path[0])
+    cleaned_data = pd.read_csv(cleaned_file_path[0])
     
     # Identify categorical columns
     categorical_cols = cleaned_data.select_dtypes(include=['object', 'category']).columns
@@ -65,9 +68,9 @@ def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
     final_pred['Evaluation_pred'] = np.where(
         final_pred['Accept_pred_prob'].isna(), "Pending",
         np.where(
-            final_pred['Accept_pred_prob'] >= 0.60, "Accept",
+            final_pred['Accept_pred_prob'] >= 0.55, "Accept",
             np.where(
-                final_pred['Accept_pred_prob'] > 0.20, "Review", "Reject"
+                final_pred['Accept_pred_prob'] > 0.30, "Review", "Reject"
             )
         )
     )
@@ -77,7 +80,7 @@ def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
     itb_file_path = list(itb_path.glob(f"*{patient_id}*.tsv"))
     if not itb_file_path:
         raise FileNotFoundError(f"No itb_review file found for patient: {patient_id}")
-    itb_file = pd.read_csv(itb_file_path[0], sep="\t")
+    itb_file = pd.read_csv(itb_file_path[0], sep="\t", dtype=str) # force all columns as string to avoid dtype issues
     
     # Join the predicted Evaluation back to the original itb_review file
     final_df = itb_file.drop(columns=['Evaluation']).merge(
@@ -86,17 +89,28 @@ def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
     final_df['Comments'] = "Probability of Accept: " + final_df['Accept_pred_prob'].round(3).astype(str)
     final_df = final_df.drop(columns=['Accept_pred_prob'])
     
+    # There are cases where the Evaluation is NA and Accept_pred_prob is NaN. 
+    # This may happen when class1 and class2 files have different number of rows. 
+    # (usually when class1 aggregated file has more rows than class2, but in 03_merge_data.py the rows are removed since the model needs all info for prediction)
+    # In this case, we will set the Evaluation to "Pending"
+    final_df.loc[(final_df['Evaluation'].isna()), 'Evaluation'] = "Pending"
+    # For rows where Evaluation is "Pending", set Comments accordingly
+    final_df.loc[final_df['Evaluation'] == "Pending", 'Comments'] = "Unable to make prediction with ML model"
+    
     # Export the itb_review file with new predictions
-    out_name = f"{patient_id}_predict_newThreshold.tsv"
-    final_df.to_csv(outdir / out_name, sep="\t", index=False)
+    out_name = f"{patient_id}_predict_newThreshold_pvacview.tsv"
+    final_df.to_csv(outdir / out_name, sep="\t", index=False, na_rep="NA") # Export as TSV with NA rather than empty cells
     
     # Make another version that keeps the Reject and Accept predicted probabilities
     final_df2 = itb_file.drop(columns=['Evaluation']).merge(
         final_pred[['ID', 'Evaluation_pred', 'Accept_pred_prob']], on="ID", how="left"
     )
-    out_name2 = f"{patient_id}_predict_newThreshold2.tsv"
-    final_df2.to_csv(outdir / out_name2, sep="\t", index=False)
+    out_name2 = f"{patient_id}_predict_newThreshold_prob.tsv"
+    final_df2.to_csv(outdir / out_name2, sep="\t", index=False, na_rep="NA")
+    
 
+# For testing
+rf_predict_on_new("10146-0061", project_dir, in_dir, outdir, label_encoders)
 # Apply the function to all patient IDs
 for patient_id in patient_id_list:
     rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders)

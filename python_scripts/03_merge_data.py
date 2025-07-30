@@ -1,11 +1,19 @@
+# %%
+# Summary of the script:
+# - Sets the working directory and defines the output directory for merged data.
+# - Loads metadata from a CSV file and filters patient IDs for ML study and external validation.
+# - Defines a function `merge_patient_df` to:
+#   - Locate and load patient-specific files from multiple directories (ITB review, all_epitopes, and class2).
+#   - Rename columns in the loaded files for clarity and consistency.
+#   - Merge data from ITB review, class2, and all_epitopes files based on shared identifiers.
+#   - Perform data transformations, including splitting and converting columns.
+#   - Save the merged data to the output directory.
+# - Tests the function with individual patient IDs and processes all patient IDs in the metadata.
+
 # %% 
 import pandas as pd
-import numpy as np
 from pathlib import Path
 import os
-from multiprocessing import Pool
-import re
-import multiprocessing
 # %%
 # Set the working directory
 project_dir = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project")
@@ -43,20 +51,20 @@ def merge_patient_df(patient_id, project_dir, out_dir):
         else:
             print(f"Patient ID {patient_id} merging files")
 
-        # Load ITB review file
+        # Load ITB review file (i.e. class 1 aggregated file)
         itb_file = pd.read_csv(itb_file_path[0], sep="\t").rename(columns={
             "Best Peptide": "Best Peptide class1",
             "Best Transcript": "Best Transcript class1",
             "IC50 MT": "IC50 MT class1",
             "IC50 WT": "IC50 WT class1",
-            "%ile MT": "percentile MT class1",
-            "%ile WT": "percentile WT class1"
+            "%ile MT": "%ile MT class1",
+            "%ile WT": "%ile WT class1"
         })
 
         # Load all_epitopes file
         epi_path = project_dir / "data" / "all_epitopes"
         epi_file_path = list(epi_path.glob(f"*{patient_id}*.tsv"))
-        epi_file = pd.read_csv(epi_file_path[0], sep="\t")
+        epi_file = pd.read_csv(epi_file_path[0], sep="\t", low_memory=False)
 
         # Load class2 file and rename columns to class 2
         c2_path = project_dir / "data" / "class2"
@@ -66,11 +74,11 @@ def merge_patient_df(patient_id, project_dir, out_dir):
             "Best Transcript": "Best Transcript class2",
             "IC50 MT": "IC50 MT class2",
             "IC50 WT": "IC50 WT class2",
-            "%ile MT": "percentile MT class2",
-            "%ile WT": "percentile WT class2"
+            "%ile MT": "%ile MT class2",
+            "%ile WT": "%ile WT class2"
         })
         # Filter columns to include ID, columns starting with "D" except "DNA VAF", and renamed columns
-        columns_to_keep = ["ID", "Best Peptide class2", "Best Transcript class2", "IC50 MT class2", "IC50 WT class2", "percentile MT class2", "percentile WT class2"]
+        columns_to_keep = ["ID", "Best Peptide class2", "Best Transcript class2", "IC50 MT class2", "IC50 WT class2", "%ile MT class2", "%ile WT class2"]
         columns_to_keep += [col for col in c2_file.columns if col.startswith("D") and col != "DNA VAF"]
         c2_file = c2_file.filter(items=columns_to_keep)
 
@@ -78,7 +86,7 @@ def merge_patient_df(patient_id, project_dir, out_dir):
         if itb_file.shape[0] != c2_file.shape[0]:
             print("itb_review file and class2 file rows DO NOT match, but continue processing...")
 
-        # Merge class2 file to itb file
+        # Merge class2 file to class 1 itb file
         itb_c2 = pd.merge(itb_file, c2_file, on="ID")
 
         # Join epi file columns
@@ -89,7 +97,7 @@ def merge_patient_df(patient_id, project_dir, out_dir):
         itb_c2['Start'] = itb_c2['Start'].astype(int)
         itb_c2['Stop'] = itb_c2['Stop'].astype(int)
         
-        # Merge class2 file to itb file
+        # Merge class1 all epitopes file to itb_c2 file
         itb_c2_epi = pd.merge(
             itb_c2, epi_file,
             left_on=["Chromosome", "Start", "Stop", "Reference", "Variant", "Best Transcript class1", "Best Peptide class1", "Allele"],
@@ -119,15 +127,8 @@ def merge_patient_df(patient_id, project_dir, out_dir):
 # Test the function with one patient
 #merge_patient_df(patient_id_list[0], project_dir, outdir)
 #merge_patient_df(patient_id_list[1], project_dir, outdir)
-#merge_patient_df("CTEP-10146-MD017-0052", project_dir, outdir)
+#merge_patient_df("10146-0061", project_dir, outdir)
 
-#%%
-# Get the number of available CPU cores
-#num_cores = multiprocessing.cpu_count()
-
-# Run the function on all patients
-#with Pool(num_cores-4) as p:
-#    p.starmap(merge_patient_df, [(pid, project_dir, outdir) for pid in patient_id_list])
 # %%
 results = [merge_patient_df(pid, project_dir, outdir) for pid in patient_id_list]
 # %%

@@ -1,0 +1,10 @@
+trial,tumor_type,total_patients,total_peptides,count_accept,count_reject,count_review
+CTEP,Metastatic TNBC,6,481,103,378,NA
+JLF,Glioblastoma,1,37,11,26,NA
+JLF,Lung adenocarcinoma,2,190,28,162,NA
+JLF,Non-Small Cell Lung Adenocarcinoma,1,93,16,77,NA
+JLF,Osteosarcoma,1,32,12,20,NA
+JLF,Pancreas,2,87,22,65,NA
+JLF,Synovial Sarcoma,1,23,9,14,NA
+Leidos/NCI,Pancreas,7,294,96,198,NA
+TOTAL,ALL,21,1237,297,940,NA

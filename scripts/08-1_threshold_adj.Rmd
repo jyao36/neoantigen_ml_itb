@@ -34,11 +34,24 @@ After this prediction, we got reviews from 4 files: 5120-16, 5120-17, 5120-18, 5
 
 This document aims to re-evaluate the 0.4/0.6 thresholds, expand the "Review" category to improve prediction accuracy on the "Accept" and "Reject" categories. 
 
+# Read metadata
+```{r read metadata}
+meta <- fread(here("output", "02_make_meta2.Rmd", "metadata_count_purity.csv"))
+```
+
+get a list of patient_id that we will make predictions 
+```{r extract patient list}
+patient_id_list <- meta %>% 
+  filter(external_validation == "Yes") %>% 
+  select(patient_id) %>% 
+  pull(patient_id)
+
+fnames <- c("5120-16", "5120-17", "5120-18", "5120-19") # patient ID
+fnames_new <- c("5120-16", "5120-17", "5120-18", "5120-19", "5120-39", "CTEP-10146-MD017-0052", "G110_Region1", "G110_Region2", "G113_Region1") # "G113_Region2" seems to have a whole bunch of pending? check 
+```
 
 # Combine predicted and true evaluation from these files
 ```{r}
-fnames <- c("5120-16", "5120-17", "5120-18", "5120-19") # patient ID
-fnames_new <- c("5120-16", "5120-17", "5120-18", "5120-19", "5120-39", "CTEP-10146-MD017-0052", "G110_Region1", "G110_Region2", "G113_Region1") # "G113_Region2" seems to have a whole bunch of pending? check 
 pred_dir <- here("output", "08_randomForest_predict.Rmd") # random forest predictions
 eval_dir <- here("data", "itb_review_new") # the real ITB reviewed files
 ```
@@ -95,7 +108,7 @@ merge_pred_eval <- function(patient_id, pred_dir, eval_dir, outdir) {
 ```{r}
 # Process all files
 all_files <- lapply(fnames, merge_pred_eval, pred_dir, eval_dir, outdir)
-all_files_new <- lapply(fnames_new, merge_pred_eval, pred_dir, eval_dir, outdir)
+all_files_new <- lapply(patient_id_list, merge_pred_eval, pred_dir, eval_dir, outdir)
 
 # Different patients have different HLA types, want to remove them before merging
 # Step 1: Identify common columns among all dataframes
@@ -167,7 +180,7 @@ merge_pred_eval_newThreshold <- function(patient_id, pred_dir, eval_dir, outdir)
 ```{r}
 # Process all files
 all_files_newThreshold <- lapply(fnames, merge_pred_eval_newThreshold, pred_dir, eval_dir, outdir)
-all_files_newThreshold_new <- lapply(fnames_new, merge_pred_eval_newThreshold, pred_dir, eval_dir, outdir)
+all_files_newThreshold_new <- lapply(patient_id_list, merge_pred_eval_newThreshold, pred_dir, eval_dir, outdir)
 
 # Different patients have different HLA types, want to remove them before merging
 # Step 1: Identify common columns among all dataframes

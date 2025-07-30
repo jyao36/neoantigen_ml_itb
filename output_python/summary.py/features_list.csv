@@ -1,0 +1,77 @@
+features
+MHCnuggetsI MT Percentile
+NetMHCcons WT IC50 Score
+NetMHCpanEL MT Percentile
+%ile MT class2
+patient_id
+NetMHC MT Percentile
+MHCflurry WT Percentile
+NetMHCpan MT IC50 Score
+NetMHCpan WT Percentile
+MHCnuggetsI WT IC50 Score
+NetMHCpanEL WT IC50 Score
+%ile WT class1
+NetMHCpanEL WT Percentile
+IC50 WT class1
+TSL
+IC50 MT class1
+MHCflurryEL Presentation WT Score
+MHCnuggetsI MT IC50 Score
+MHCnuggetsI WT Percentile
+Corresponding WT Percentile
+Ref Match
+PickPocket WT IC50 Score
+NetMHCpan MT Percentile
+SMM WT IC50 Score
+Prob match
+%ile MT class1
+Corresponding WT IC50 Score
+MHCflurryEL Processing WT Score
+MHCflurryEL Presentation WT Percentile
+MHCflurryEL Presentation MT Percentile
+NetMHCcons MT IC50 Score
+MHCflurry MT IC50 Score
+MHCflurryEL Processing MT Score
+MHCflurry WT IC50 Score
+NetMHCcons WT Percentile
+NetMHCpanEL MT IC50 Score
+Evaluation
+PickPocket MT IC50 Score
+RNA Depth
+NetMHC WT IC50 Score
+SMM MT IC50 Score
+ID
+Num Passing Peptides
+SMMPMBEC WT IC50 Score
+Pos
+NetMHC MT IC50 Score
+%ile WT class2
+Best MT IC50 Score
+DNA VAF
+NetMHCcons MT Percentile
+IC50 MT class2
+Best MT Percentile
+PickPocket MT Percentile
+SMM MT Percentile
+NetMHC WT Percentile
+Variant Type
+MHCflurryEL Presentation MT Score
+Corresponding Fold Change
+Allele Expr
+SMMPMBEC MT Percentile
+Peptide Length
+IC50 WT class2
+Gene of Interest
+RNA Expr
+Biotype
+RNA VAF
+SMM WT Percentile
+NetMHCpan WT IC50 Score
+Median Fold Change
+SMMPMBEC WT Percentile
+PickPocket WT Percentile
+cysteine_count
+SMMPMBEC MT IC50 Score
+MHCflurry MT Percentile
+data_source
+Prob Pos
