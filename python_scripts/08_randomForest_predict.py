@@ -5,12 +5,21 @@ import joblib
 from pathlib import Path
 import os
 from sklearn.preprocessing import LabelEncoder
+import pickle
 
 #%% Load the trained Random Forest model and metadata -----------------------------------------------------
 # Load the trained Random Forest model
 #model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/model_artifacts/rf_model_final.pkl")
-model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/transform_training_data4python.ipynb/rf_model.pkl")
+model_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/transform_training_data_model.ipynb/rf_model.pkl")
 rf_model = joblib.load(model_path)
+
+# Load the trained imputer and label encoders
+imputer_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/model_artifacts/trained_imputer.joblib")
+label_encoders_path = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project/output_python/model_artifacts/label_encoders.pkl")
+
+imputer = joblib.load(imputer_path)
+with open(label_encoders_path, "rb") as f:
+    trained_label_encoders = pickle.load(f)
 
 # Define directories
 project_dir = Path("/Users/Jennie/Desktop/WashU/Rotation_labs/Griffith Lab/Neoantigen ML project")
@@ -50,7 +59,32 @@ def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
         raise FileNotFoundError(f"No cleaned data file found for patient: {patient_id}")
     cleaned_data = pd.read_csv(cleaned_file_path[0])
     
-    # Identify categorical columns
+    # --- Imputation section ---
+    # Prepare columns for imputation
+    exclude_columns = ["ID", "Evaluation", "patient_id"]  # Add any other columns you want to exclude
+    columns_to_impute = cleaned_data.columns.difference(exclude_columns)
+    
+    excluded_data = cleaned_data[exclude_columns].copy()
+    data_to_impute = cleaned_data[columns_to_impute].copy()
+    
+    # Apply label encoding to categorical columns for imputation
+    categorical_columns = data_to_impute.select_dtypes(include=['category', 'object']).columns
+    for col in categorical_columns:
+        if col in trained_label_encoders:
+            le = trained_label_encoders[col]
+            # Handle unseen categories by using the most common category
+            data_to_impute.loc[:, col] = data_to_impute[col].map(
+                lambda x: le.transform([x])[0] if x in le.classes_ else le.transform([le.classes_[0]])[0]
+            )
+    
+    # Impute missing values
+    imputed_data = imputer.transform(data_to_impute)
+    imputed_data = pd.DataFrame(imputed_data, columns=columns_to_impute)
+    
+    # Combine imputed and excluded columns
+    cleaned_data = pd.concat([excluded_data.reset_index(drop=True), imputed_data.reset_index(drop=True)], axis=1)
+    
+    # Identify categorical columns for final encoding
     categorical_cols = cleaned_data.select_dtypes(include=['object', 'category']).columns
     
     # Apply label encoding to the categorical columns
@@ -110,7 +144,7 @@ def rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders):
     
 
 # For testing
-rf_predict_on_new("10146-0061", project_dir, in_dir, outdir, label_encoders)
+#rf_predict_on_new("10146-0061", project_dir, in_dir, outdir, label_encoders)
 # Apply the function to all patient IDs
 for patient_id in patient_id_list:
     rf_predict_on_new(patient_id, project_dir, in_dir, outdir, label_encoders)
